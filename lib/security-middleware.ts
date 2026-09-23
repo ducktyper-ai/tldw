@@ -6,6 +6,8 @@ import {
 } from '@/lib/rate-limiter';
 import { AuditLogger, AuditAction } from '@/lib/audit-logger';
 import { createClient } from '@/lib/supabase/server';
+import { DependencyUnavailableError, dependencyUnavailable, unavailableResponse } from '@/lib/dependency-unavailable';
+import { assertPaidDependencies } from '@/lib/paid-work';
 import {
   validateCSRF,
   injectCSRFToken,
@@ -22,6 +24,7 @@ export interface SecurityMiddlewareConfig {
   maxBodySize?: number; // In bytes
   allowedMethods?: string[];
   csrfProtection?: boolean;
+  paidWork?: boolean;
 }
 
 /**
@@ -54,6 +57,10 @@ export function withSecurity(
           error
         } = await supabase.auth.getUser();
 
+        if (config.paidWork && error && error.name !== 'AuthSessionMissingError') {
+          throw dependencyUnavailable('auth', error);
+        }
+
         if (error || !user) {
           await AuditLogger.logSecurityEvent(AuditAction.UNAUTHORIZED_ACCESS, {
             endpoint: req.url
@@ -69,8 +76,8 @@ export function withSecurity(
       // 3. Apply rate limiting
       if (config.rateLimit) {
         const rateLimitResult = await RateLimiter.check(
-          req.url,
-          config.rateLimit
+          new URL(req.url).pathname,
+          { ...config.rateLimit, failClosed: config.paidWork }
         );
 
         if (!rateLimitResult.allowed) {
@@ -114,6 +121,18 @@ export function withSecurity(
         }
       }
 
+      if (config.paidWork) {
+        await assertPaidDependencies();
+        // Routes without a general limiter still require a durable admission record.
+        if (!config.rateLimit) {
+          const result = await RateLimiter.check(new URL(req.url).pathname, {
+            ...RATE_LIMITS.API_GENERAL, failClosed: true,
+          });
+          const denied = rateLimitResponse(result);
+          if (denied) return denied;
+        }
+      }
+
       // 6. Add security headers to response
       const response = await handler(req);
 
@@ -149,6 +168,10 @@ export function withSecurity(
 
       return response;
     } catch (error) {
+      if (error instanceof DependencyUnavailableError) {
+        const response = unavailableResponse();
+        return new NextResponse(response.body, { status: response.status, headers: response.headers });
+      }
       // Log unexpected errors
       console.error('Security middleware error:', error);
 
@@ -179,6 +202,12 @@ function isAllowedOrigin(origin: string): boolean {
  * Preset security configurations
  */
 export const SECURITY_PRESETS = {
+  PAID: {
+    paidWork: true,
+    rateLimit: RATE_LIMITS.API_GENERAL,
+    maxBodySize: 1024 * 1024,
+    allowedMethods: ['POST']
+  },
   PUBLIC: {
     rateLimit: RATE_LIMITS.API_GENERAL,
     maxBodySize: 1024 * 1024, // 1MB

@@ -45,7 +45,7 @@ test('generate highlights reveals cached topics locally before calling video-ana
   assert.match(handleSource, /cachedHighlightPayloadRef\.current = null/);
 
   const cachedRevealIndex = handleSource.indexOf('applyHighlightResponse(cachedHighlightPayload');
-  const fetchIndex = handleSource.indexOf('fetch("/api/video-analysis"');
+  const fetchIndex = handleSource.indexOf('paidFetch("/api/video-analysis"');
   assert.ok(cachedRevealIndex > -1 && fetchIndex > -1 && cachedRevealIndex < fetchIndex);
 });
 

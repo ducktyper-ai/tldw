@@ -144,4 +144,4 @@ ${trimmedPreview}
   }
 }
 
-export const POST = withSecurity(handler, SECURITY_PRESETS.PUBLIC);
+export const POST = withSecurity(handler, SECURITY_PRESETS.PAID);

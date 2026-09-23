@@ -98,6 +98,7 @@ const summaryResponseSchema = z.union([
 ]);
 
 interface AIChatProps {
+  paidFetch?: typeof fetch;
   transcript: TranscriptSegment[];
   topics: Topic[];
   videoId: string;
@@ -116,6 +117,7 @@ interface AIChatProps {
 }
 
 export function AIChat({
+  paidFetch = fetch,
   transcript,
   topics,
   videoId,
@@ -391,7 +393,7 @@ export function AIChat({
   const fetchSuggestedQuestions = useCallback(async () => {
     setLoadingQuestions(true);
     try {
-      const response = await fetch("/api/suggested-questions", {
+      const response = await paidFetch("/api/suggested-questions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -435,7 +437,7 @@ export function AIChat({
     } finally {
       setLoadingQuestions(false);
     }
-  }, [transcript, sanitizedTopicsForChat, videoTitle, applyFallbackSuggestedQuestions, selectedLanguage]);
+  }, [transcript, sanitizedTopicsForChat, videoTitle, applyFallbackSuggestedQuestions, selectedLanguage, paidFetch]);
   // Update suggested questions when cached questions change
   useEffect(() => {
     if (cachedSuggestedQuestions && cachedSuggestedQuestions.length > 0) {
@@ -476,7 +478,7 @@ export function AIChat({
     }
 
     try {
-      const response = await fetch("/api/suggested-questions", {
+      const response = await paidFetch("/api/suggested-questions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -519,7 +521,7 @@ export function AIChat({
     } catch {
       return buildFallbackFollowUps();
     }
-  }, [transcript, sanitizedTopicsForChat, videoTitle, suggestedQuestions, selectedLanguage]);
+  }, [transcript, sanitizedTopicsForChat, videoTitle, suggestedQuestions, selectedLanguage, paidFetch]);
 
   const sendMessage = useCallback(async (messageInput?: SuggestedMessage, retryCount = 0) => {
     const isObjectInput = typeof messageInput === "object" && messageInput !== null;
@@ -600,7 +602,7 @@ export function AIChat({
         ...(selectedLanguage && { targetLanguage: selectedLanguage }),
       };
 
-      const response = await fetch("/api/chat", {
+      const response = await paidFetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
@@ -735,7 +737,7 @@ export function AIChat({
         }
       }
     }
-  }, [input, isLoading, messages, transcript, sanitizedTopicsForChat, videoId, requestFollowUpQuestions, selectedLanguage]);
+  }, [input, isLoading, messages, transcript, sanitizedTopicsForChat, videoId, requestFollowUpQuestions, selectedLanguage, paidFetch]);
 
   const executeKeyTakeaways = useCallback(
     async ({ skipUserMessage = false }: { skipUserMessage?: boolean } = {}) => {
@@ -795,7 +797,7 @@ export function AIChat({
           description: videoInfo?.description,
         };
 
-        const summaryResponse = await fetch("/api/generate-summary", {
+        const summaryResponse = await paidFetch("/api/generate-summary", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -864,7 +866,7 @@ export function AIChat({
         }
       }
     },
-    [askedQuestions, isLoading, transcript, videoInfo, videoId, videoTitle, requestFollowUpQuestions, selectedLanguage, translatedKeyTakeawaysLabel]
+    [askedQuestions, isLoading, transcript, videoInfo, videoId, videoTitle, requestFollowUpQuestions, selectedLanguage, translatedKeyTakeawaysLabel, paidFetch]
   );
 
   const executeTopQuotes = useCallback(
@@ -925,7 +927,7 @@ export function AIChat({
           description: videoInfo?.description,
         };
 
-        const response = await fetch("/api/top-quotes", {
+        const response = await paidFetch("/api/top-quotes", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -994,7 +996,7 @@ export function AIChat({
         }
       }
     },
-    [askedQuestions, isLoading, transcript, videoInfo, videoTitle, requestFollowUpQuestions, selectedLanguage, translatedTopQuotesLabel]
+    [askedQuestions, isLoading, transcript, videoInfo, videoTitle, requestFollowUpQuestions, selectedLanguage, translatedTopQuotesLabel, paidFetch]
   );
 
   const handleAskKeyTakeaways = useCallback(() => {
@@ -1169,6 +1171,7 @@ export function AIChat({
           <div className="space-y-3.5 pt-3">
             <div className="flex w-full flex-col items-end gap-2">
               <ImageCheatsheetCard
+                paidFetch={paidFetch}
                 transcript={transcript}
                 videoId={videoId}
                 videoTitle={videoTitle}

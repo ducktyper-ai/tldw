@@ -129,6 +129,7 @@ async function handler(req: NextRequest) {
 }
 
 export const POST = withSecurity(handler, {
+  paidWork: true,
   requireAuth: true,
   rateLimit: {
     windowMs: 60 * 1000,

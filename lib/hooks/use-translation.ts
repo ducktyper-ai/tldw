@@ -3,6 +3,7 @@ import { TranslationBatcher } from '@/lib/translation-batcher';
 import type { TranslationContext, TranslationScenario } from '@/lib/translation/types';
 import type { VideoInfo } from '@/lib/types';
 import { toast } from 'sonner';
+import { DependencyUnavailableError } from '@/lib/dependency-unavailable';
 
 export type BulkTranslationHandler = (
   items: Array<{ index: number; text: string }>,
@@ -12,7 +13,7 @@ export type BulkTranslationHandler = (
   onProgress?: (completed: number, total: number) => void
 ) => Promise<Map<number, string>>;
 
-export function useTranslation() {
+export function useTranslation(paidFetch: typeof fetch = fetch) {
   const [selectedLanguage, setSelectedLanguage] = useState<string | null>(null);
   const [translationCache] = useState<Map<string, string>>(new Map());
   const translationBatcherRef = useRef<TranslationBatcher | null>(null);
@@ -57,7 +58,8 @@ export function useTranslation() {
           setTimeout(() => {
             errorShownRef.current = false;
           }, 10000);
-        }
+        },
+        paidFetch
       );
     }
 
@@ -86,7 +88,7 @@ export function useTranslation() {
     }
 
     return translation;
-  }, [translationCache, selectedLanguage]);
+  }, [translationCache, selectedLanguage, paidFetch]);
 
   const handleLanguageChange = useCallback((languageCode: string | null) => {
     setSelectedLanguage(languageCode);
@@ -158,7 +160,7 @@ export function useTranslation() {
 
     const chunkPromises = chunks.map(async (chunk) => {
       try {
-        const response = await fetch('/api/translate', {
+        const response = await paidFetch('/api/translate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -167,6 +169,7 @@ export function useTranslation() {
             context,
           }),
         });
+        if (response.status === 503) throw new DependencyUnavailableError('translation');
 
         if (!response.ok) {
           throw new Error(`Translation API error: ${response.status}`);
@@ -190,6 +193,7 @@ export function useTranslation() {
           onProgress(completedCount, items.length);
         }
       } catch (error) {
+        if (error instanceof DependencyUnavailableError) throw error;
         console.error('[Bulk Translation] Chunk error:', error);
         // Fallback to original text for this chunk
         for (const item of chunk) {
@@ -218,7 +222,7 @@ export function useTranslation() {
     }
 
     return results;
-  }, [translationCache]);
+  }, [translationCache, paidFetch]);
 
   return {
     selectedLanguage,

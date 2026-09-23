@@ -4,6 +4,8 @@ import { createClient } from '@/lib/supabase/server';
 import { VideoPageClient } from './video-page-client';
 import { Topic, TranscriptSegment, VideoInfo } from '@/lib/types';
 import { buildVideoSlug } from '@/lib/utils';
+import { dependencyUnavailable } from '@/lib/dependency-unavailable';
+import { ServiceUnavailable } from '@/components/service-unavailable';
 
 // Extract video ID from slug (format: "title-words-videoId")
 function extractVideoIdFromSlug(slug: string): string | null {
@@ -31,7 +33,7 @@ interface VideoAnalysisRow {
   updated_at?: string;
 }
 
-async function resolveVideoFromSlug(
+async function lookupVideoFromSlug(
   supabase: SupabaseServerClient,
   slug: string
 ): Promise<{ video: VideoAnalysisRow; videoId: string; canonicalSlug: string } | null> {
@@ -45,9 +47,7 @@ async function resolveVideoFromSlug(
       .eq('youtube_id', videoIdFromSlug)
       .maybeSingle();
 
-    if (error && error.code !== 'PGRST116') {
-      console.error('Error fetching video analysis by youtube_id', { slug, videoIdFromSlug, error });
-    }
+    if (error) throw dependencyUnavailable('public-video', error);
 
     if (data) {
       const canonicalSlug = buildVideoSlug(data.title, data.youtube_id);
@@ -62,9 +62,7 @@ async function resolveVideoFromSlug(
     .eq('slug', slug)
     .maybeSingle();
 
-  if (error && error.code !== 'PGRST116') {
-    console.error('Error fetching video analysis by slug', { slug, error });
-  }
+  if (error) throw dependencyUnavailable('public-video', error);
 
   if (data) {
     const canonicalSlug = buildVideoSlug(data.title, data.youtube_id);
@@ -74,6 +72,15 @@ async function resolveVideoFromSlug(
   return null;
 }
 
+async function resolveVideoFromSlug(slug: string) {
+  try {
+    return await lookupVideoFromSlug(await createClient(), slug);
+  } catch (error) {
+    dependencyUnavailable('public-video', error);
+    return { unavailable: true } as const;
+  }
+}
+
 interface PageProps {
   params: Promise<{ slug: string }>;
 }
@@ -81,8 +88,10 @@ interface PageProps {
 // Generate metadata for SEO
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
   const { slug } = await params;
-  const supabase = await createClient();
-  const resolved = await resolveVideoFromSlug(supabase, slug);
+  const resolved = await resolveVideoFromSlug(slug);
+  if (resolved && 'unavailable' in resolved) {
+    return { title: 'Service temporarily unavailable - LongCut', robots: { index: false } };
+  }
 
   if (!resolved) {
     return {
@@ -164,8 +173,8 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 // Main page component (Server Component)
 export default async function VideoPage({ params }: PageProps) {
   const { slug } = await params;
-  const supabase = await createClient();
-  const resolved = await resolveVideoFromSlug(supabase, slug);
+  const resolved = await resolveVideoFromSlug(slug);
+  if (resolved && 'unavailable' in resolved) return <ServiceUnavailable />;
 
   if (!resolved) {
     const fallbackVideoId = extractVideoIdFromSlug(slug);

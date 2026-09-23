@@ -23,6 +23,8 @@ const translationSelectorEnabled = (() => {
 })();
 
 interface RightColumnTabsProps {
+  paidFetch?: typeof fetch;
+  paidWorkUnavailable?: boolean;
   transcript: TranscriptSegment[];
   selectedTopic: Topic | null;
   onTimestampClick: (seconds: number, endSeconds?: number, isCitation?: boolean, citationText?: string, isWithinHighlightReel?: boolean, isWithinCitationHighlight?: boolean) => void;
@@ -66,6 +68,8 @@ export interface RightColumnTabsHandle {
 }
 
 export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabsProps>(({
+  paidFetch,
+  paidWorkUnavailable = false,
   transcript,
   selectedTopic,
   onTimestampClick,
@@ -116,10 +120,10 @@ export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabs
 
   useEffect(() => {
     // If chat tab is removed while active, switch to transcript
-    if (!showChatTab && activeTab === "chat") {
+    if ((!showChatTab || paidWorkUnavailable) && activeTab === "chat") {
       setActiveTab("transcript");
     }
-  }, [showChatTab, activeTab]);
+  }, [showChatTab, paidWorkUnavailable, activeTab]);
 
   return (
     <Card className="h-full flex flex-col overflow-hidden p-0 gap-0 border-0">
@@ -160,7 +164,7 @@ export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabs
             </div>
           )}
         </div>
-        {showChatTab && (
+        {showChatTab && !paidWorkUnavailable && (
           <Button
             variant="ghost"
             size="sm"
@@ -212,7 +216,8 @@ export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabs
           />
         </div>
         <div className={cn("absolute inset-0", (activeTab !== "chat" || !showChatTab) && "hidden")}>
-          <AIChat
+          {!paidWorkUnavailable && <AIChat
+            paidFetch={paidFetch}
             transcript={transcript}
             topics={topics || []}
             videoId={videoId}
@@ -228,7 +233,7 @@ export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabs
             onRequestTranslation={onRequestTranslation}
             isAuthenticated={isAuthenticated}
             onRequestSignIn={onRequestSignIn}
-          />
+          />}
         </div>
         <div className={cn("absolute inset-0", activeTab !== "notes" && "hidden")}
         >

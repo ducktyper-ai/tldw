@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { createClient } from '@/lib/supabase/server';
 import type { SubscriptionTier, UserSubscription } from '@/lib/subscription-manager';
 import { getUserSubscriptionStatus } from '@/lib/subscription-manager';
+import { dependencyUnavailable } from '@/lib/dependency-unavailable';
 
 export interface ImageUsageStats {
   tier: SubscriptionTier;
@@ -77,12 +78,11 @@ async function fetchImageUsageInPeriod(
   });
 
   if (error) {
-    console.error('Failed to fetch image usage breakdown:', error);
-    return 0;
+    throw dependencyUnavailable('image-usage', error);
   }
 
   if (!Array.isArray(data)) {
-    return 0;
+    throw dependencyUnavailable('image-usage-response');
   }
 
   return data.reduce((sum, row) => sum + Number(row.counted ?? 0), 0);
@@ -202,7 +202,7 @@ export async function consumeImageCreditAtomic({
   });
 
   if (error) {
-    console.error('Atomic image credit consumption failed:', error);
+    dependencyUnavailable('image-credit-record', error);
     return { success: false, error: 'ATOMIC_CONSUMPTION_FAILED' };
   }
 

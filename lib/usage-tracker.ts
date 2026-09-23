@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { createClient } from '@/lib/supabase/server';
+import { dependencyUnavailable } from '@/lib/dependency-unavailable';
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -52,8 +53,7 @@ export async function fetchUsageBreakdown({
   });
 
   if (error) {
-    console.error('Failed to compute usage breakdown:', error);
-    throw error;
+    throw dependencyUnavailable('usage', error);
   }
 
   const breakdown: UsageBreakdown = {
@@ -64,7 +64,7 @@ export async function fetchUsageBreakdown({
   };
 
   if (!Array.isArray(data)) {
-    return breakdown;
+    throw dependencyUnavailable('usage-response');
   }
 
   for (const row of data) {

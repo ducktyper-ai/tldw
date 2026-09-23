@@ -31,6 +31,7 @@ const STYLE_OPTIONS = [
 ];
 
 interface ImageCheatsheetCardProps {
+  paidFetch?: typeof fetch;
   transcript: TranscriptSegment[];
   videoId: string;
   videoTitle?: string;
@@ -74,6 +75,7 @@ const DEFAULT_LABELS = {
 };
 
 export function ImageCheatsheetCard({
+  paidFetch = fetch,
   transcript,
   videoId,
   videoTitle,
@@ -207,7 +209,7 @@ export function ImageCheatsheetCard({
     setError(null);
 
     try {
-      const res = await fetch("/api/generate-image", {
+      const res = await paidFetch("/api/generate-image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -278,6 +280,7 @@ export function ImageCheatsheetCard({
     remaining,
     limit,
     onImageGenerated,
+    paidFetch,
   ]);
 
   const buttonText = useMemo(() => {
