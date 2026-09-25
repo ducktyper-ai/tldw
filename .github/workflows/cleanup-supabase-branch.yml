@@ -1,29 +1,39 @@
 name: Cleanup Supabase Branch
 
+# Public repository: a run that holds the Supabase token is never started by a
+# pull request. It runs when a branch of this repository is deleted (only
+# people with write access can do that), or by hand for a named branch.
 on:
-  pull_request:
-    types: [closed]
+  delete:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: The git branch whose Supabase preview branch to delete
+        required: true
+        type: string
 
-permissions: {}
+permissions: {} # none by default; the job grants its own
 
 jobs:
   cleanup:
-    # Preview branches exist only for this repository's own branches; a fork's
-    # PR gets no secrets and has nothing to clean up.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch' || github.event.ref_type == 'branch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Setup Supabase CLI
-        uses: supabase/setup-cli@1dedf2c611547ede7232d26866dd3c56ab903bbb # v1
+        uses: supabase/setup-cli@1dedf2c611547ede7232d26866dd3c56ab903bbb # v1.7.3
         with:
-          version: latest
+          version: 2.117.0
 
       - name: Delete Supabase preview branch
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          # The branch name is chosen by whoever opened the PR, so it is passed
-          # as data, never expanded into the script.
-          BRANCH: ${{ github.head_ref }}
+          # The branch name is passed as data, never expanded into the script,
+          # and must be an ordinary branch name.
+          BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.event.ref }}
         run: |
+          if ! [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "refusing branch name: not [A-Za-z0-9._/-]+" >&2
+            exit 1
+          fi
           supabase --experimental branches delete "$BRANCH" --project-ref ioczjdqhdcjmrnsicqqz || true
