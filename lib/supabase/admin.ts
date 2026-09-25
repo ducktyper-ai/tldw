@@ -1,7 +1,7 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 const globalForSupabase = globalThis as typeof globalThis & {
-  __supabaseServiceClient?: ReturnType<typeof createClient>;
+  __supabaseServiceClient?: SupabaseClient;
 };
 
 /**

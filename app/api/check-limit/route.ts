@@ -7,6 +7,7 @@ import {
   TIER_LIMITS,
 } from '@/lib/subscription-manager';
 import { getGuestAccessState, setGuestCookies } from '@/lib/guest-usage';
+import { dependencyUnavailable, unavailableResponse } from '@/lib/dependency-unavailable';
 
 /**
  * GET /api/check-limit
@@ -32,12 +33,13 @@ async function handler(_request: NextRequest) {
 
     // Check if user is authenticated
     const {
-      data: { user },
+      data: { user }, error: authError,
     } = await supabase.auth.getUser();
+    if (authError && authError.name !== 'AuthSessionMissingError') throw dependencyUnavailable('auth', authError);
 
     // Handle anonymous guests with a one-time allowance
     if (!user) {
-      const guestState = await getGuestAccessState({ supabase });
+      const guestState = await getGuestAccessState();
       const canGenerate = !guestState.used;
 
       const response = NextResponse.json({
@@ -152,14 +154,9 @@ async function handler(_request: NextRequest) {
       },
     });
   } catch (error) {
-    // Log error details server-side only
-    console.error('Error checking generation limit:', error);
-
-    // Return generic error message to client
-    return NextResponse.json(
-      { error: 'An error occurred while checking limits' },
-      { status: 500 }
-    );
+    dependencyUnavailable('spending-eligibility', error);
+    const response = unavailableResponse();
+    return new NextResponse(response.body, { status: 503, headers: response.headers });
   }
 }
 

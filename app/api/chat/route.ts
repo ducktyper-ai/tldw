@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { DependencyUnavailableError } from '@/lib/dependency-unavailable';
 import { TranscriptSegment, Topic, Citation } from '@/lib/types';
 import { normalizeTimestampSources } from '@/lib/timestamp-normalization';
 import { extractTimestamps, parseTimestamp } from '@/lib/timestamp-utils';
@@ -78,7 +79,8 @@ async function handler(request: NextRequest) {
     let validatedData;
     try {
       validatedData = chatRequestSchema.parse(body);
-    } catch (error) {
+  } catch (error) {
+    if (error instanceof DependencyUnavailableError) throw error;
       if (error instanceof z.ZodError) {
         return NextResponse.json(
           {
@@ -379,6 +381,7 @@ ${message}
 
 // Apply security (rate limiting is handled internally in the route)
 export const POST = withSecurity(handler, {
+  paidWork: true,
   maxBodySize: 10 * 1024 * 1024, // 10MB for large transcripts and chat history
   allowedMethods: ['POST']
 });

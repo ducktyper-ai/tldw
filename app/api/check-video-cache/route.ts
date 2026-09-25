@@ -4,6 +4,7 @@ import { extractVideoId } from '@/lib/utils';
 import { withSecurity, SECURITY_PRESETS } from '@/lib/security-middleware';
 import { ensureMergedFormat } from '@/lib/transcript-format-detector';
 import { TranscriptSegment } from '@/lib/types';
+import { dependencyUnavailable, unavailableResponse } from '@/lib/dependency-unavailable';
 
 async function handler(req: NextRequest) {
   try {
@@ -31,13 +32,15 @@ async function handler(req: NextRequest) {
     const { data: { user } } = await supabase.auth.getUser();
 
     // Check for cached video
-    const { data: cachedVideo } = await supabase
+    const { data: cachedVideo, error: cacheError } = await supabase
       .from('video_analyses')
       .select('*')
       .eq('youtube_id', videoId)
-      .single();
+      .maybeSingle();
 
-    if (cachedVideo && cachedVideo.topics) {
+    if (cacheError) throw dependencyUnavailable('video-cache', cacheError);
+
+    if (cachedVideo) {
       let ownedByCurrentUser = false;
 
       if (user?.id) {
@@ -97,6 +100,7 @@ async function handler(req: NextRequest) {
 
       // Return all cached data including transcript and video info
       return NextResponse.json({
+        status: 'found',
         cached: true,
         videoId: videoId,
         // Include the database UUID so the client can pass it directly to
@@ -121,16 +125,15 @@ async function handler(req: NextRequest) {
 
     // Video not cached
     return NextResponse.json({
+      status: 'absent',
       cached: false,
       videoId: videoId
     });
 
   } catch (error) {
-    console.error('Error checking video cache:', error);
-    return NextResponse.json(
-      { error: 'Failed to check video cache' },
-      { status: 500 }
-    );
+    dependencyUnavailable('video-cache', error);
+    const response = unavailableResponse();
+    return new NextResponse(response.body, { status: 503, headers: response.headers });
   }
 }
 
