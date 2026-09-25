@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs';
 import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 
-// Deliberately no URL/env input: this runner can only reach this local disposable container.
-const container = 'longcut-limiter-test';
+// Deliberately no URL/env input or published ports. A fresh cluster also isolates roles.
+const container = `longcut-limiter-test-${process.pid}-${Date.now()}`;
 const database = `limiter_test_${Date.now()}`;
 const args = ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', database, '-v', 'ON_ERROR_STOP=1', '-At'];
 function sql(text) { return execFileSync('docker', args, { input: text, encoding: 'utf8' }).trim(); }
@@ -12,6 +12,17 @@ function denied(text) {
   assert.notEqual(result.status, 0, `Expected permission rejection: ${text}`);
   assert.match(result.stderr, /permission denied/);
 }
+execFileSync('docker', ['run', '--rm', '-d', '--name', container, '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', 'postgres:17']);
+async function run() {
+let ready = false;
+for (let attempt = 0; attempt < 60; attempt++) {
+  if (spawnSync('docker', ['exec', container, 'pg_isready', '-U', 'postgres']).status === 0) {
+    ready = true;
+    break;
+  }
+  await new Promise(resolve => setTimeout(resolve, 500));
+}
+assert.ok(ready, 'Disposable PostgreSQL did not become ready');
 execFileSync('docker', ['exec', container, 'createdb', '-U', 'postgres', database]);
 const initial = readFileSync(new URL('../supabase/migrations/20241107000000_initial_schema.sql', import.meta.url), 'utf8');
 const audit = readFileSync(new URL('../supabase/migrations/20251101120001_add_audit_and_rate_limit_tables.sql', import.meta.url), 'utf8');
@@ -36,7 +47,48 @@ sql(`
   ${audit.slice(audit.indexOf('CREATE TABLE IF NOT EXISTS rate_limits'))}
 `);
 assert.equal(sql("SELECT count(*) FROM pg_policies WHERE tablename = 'rate_limits'"), '4');
-sql(migration);
+// Production-like executor: not the bootstrap superuser. public is owned by
+// pg_database_owner; the executor owns the database, limiter table and cleanup.
+sql(`
+  CREATE ROLE migration_executor LOGIN NOSUPERUSER CREATEROLE BYPASSRLS;
+  ALTER DATABASE ${database} OWNER TO migration_executor;
+  ALTER SCHEMA public OWNER TO pg_database_owner;
+  REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+  ALTER TABLE public.rate_limits OWNER TO migration_executor;
+  ALTER FUNCTION public.cleanup_old_rate_limits() OWNER TO migration_executor;
+  CREATE POLICY production_expired_delete ON public.rate_limits
+    FOR DELETE USING (timestamp < now() - interval '48 hours');
+  CREATE OR REPLACE FUNCTION public.cleanup_old_rate_limits()
+  RETURNS void LANGUAGE sql SECURITY DEFINER AS $$
+    DELETE FROM public.rate_limits WHERE timestamp < now() - interval '24 hours';
+  $$;
+  INSERT INTO public.rate_limits(key, identifier) VALUES ('rollback-sentinel', 'sentinel');
+`);
+const executorArgs = args.map(value => value === 'postgres' ? 'migration_executor' : value);
+const snapshot = () => sql(`SELECT jsonb_build_object(
+  'policies', (SELECT jsonb_agg(to_jsonb(p) ORDER BY policyname) FROM pg_policies p WHERE tablename = 'rate_limits'),
+  'table_acl', (SELECT relacl FROM pg_class WHERE oid = 'public.rate_limits'::regclass),
+  'schema_acl', (SELECT nspacl FROM pg_namespace WHERE nspname = 'public'),
+  'cleanup', pg_get_functiondef('public.cleanup_old_rate_limits()'::regprocedure),
+  'cleanup_acl', (SELECT proacl FROM pg_proc WHERE oid = 'public.cleanup_old_rate_limits()'::regprocedure),
+  'memberships', (SELECT jsonb_agg(to_jsonb(m) ORDER BY roleid, member, grantor) FROM pg_auth_members m),
+  'rows', (SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM public.rate_limits r)
+)`);
+assert.equal(sql("SELECT rolsuper FROM pg_roles WHERE rolname = 'migration_executor'"), 'f');
+const before = snapshot();
+// Fail after all permission changes: transaction must restore policies, ACLs,
+// cleanup definition, rows and memberships, including removal of the new role.
+const rollback = spawnSync('docker', executorArgs, { encoding: 'utf8', input:
+  migration.replace('COMMIT;', "DO $$ BEGIN RAISE EXCEPTION 'injected pre-commit failure'; END $$; COMMIT;") });
+assert.notEqual(rollback.status, 0);
+assert.match(rollback.stderr, /injected pre-commit failure/);
+assert.equal(snapshot(), before);
+assert.equal(sql("SELECT count(*) FROM pg_roles WHERE rolname = 'limiter_executor'"), '0');
+assert.equal(sql("SELECT count(*) FROM pg_proc WHERE proname IN ('check_rate_limit_server', 'guest_usage_server')"), '0');
+execFileSync('docker', executorArgs, { input: migration, encoding: 'utf8' });
+assert.equal(sql("SELECT has_schema_privilege('limiter_executor', 'public', 'CREATE')"), 'f');
+assert.equal(sql("SELECT pg_has_role('migration_executor', 'limiter_executor', 'SET') OR pg_has_role('migration_executor', 'limiter_executor', 'USAGE')"), 'f');
+assert.equal(sql("SELECT count(*) FROM pg_proc WHERE proname IN ('check_rate_limit_server', 'guest_usage_server') AND proowner = 'limiter_executor'::regrole AND prosecdef AND proconfig = ARRAY['search_path=\"\"']"), '2');
 assert.equal(sql("SELECT count(*) FROM pg_policies WHERE tablename = 'rate_limits'"), '1');
 sql("INSERT INTO public.rate_limits(key, identifier, timestamp) VALUES ('ratelimit:expired', 'expired', now() - interval '32 days'), ('guest-analysis', 'permanent-guest', now() - interval '32 days')");
 
@@ -79,7 +131,7 @@ sql('REVOKE SELECT ON public.rate_limits FROM limiter_executor');
 denied("SET ROLE service_role; SELECT public.check_rate_limit_server('read-failure', 'read-failure', 60000, 1, true)");
 sql('GRANT SELECT ON public.rate_limits TO limiter_executor');
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE key = 'read-failure'"), '0');
-assert.equal(sql("SELECT rolcanlogin OR rolbypassrls OR rolsuper FROM pg_roles WHERE rolname = 'limiter_executor'"), 'f');
+assert.equal(sql("SELECT rolcanlogin OR rolbypassrls OR rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication FROM pg_roles WHERE rolname = 'limiter_executor'"), 'f');
 denied("SET ROLE limiter_executor; UPDATE public.rate_limits SET key = 'forged'");
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE key = 'ratelimit:expired'"), '0');
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE identifier = 'permanent-guest'"), '1');
@@ -95,4 +147,10 @@ const admissions = await Promise.all(Array.from({ length: 8 }, () => new Promise
 })));
 assert.equal(admissions.filter(result => result.allowed).length, 1);
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE key = 'concurrent'"), '1');
-console.log('PASS: historical policies, anonymous/authenticated isolation, server admission/read/write, guest persistence, retention, concurrency, failure and recovery.');
+console.log('PASS: non-superuser ownership transfer, transactional rollback, narrow privileges, historical policies, anonymous/authenticated isolation, server admission/read/write, guest persistence, retention, concurrency, failure and recovery.');
+}
+try {
+  await run();
+} finally {
+  execFileSync('docker', ['rm', '-f', container], { stdio: 'ignore' });
+}

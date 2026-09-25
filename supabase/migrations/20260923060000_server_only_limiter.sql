@@ -83,6 +83,9 @@ BEGIN
 END $$;
 
 -- The definer has only SELECT/INSERT/DELETE on this table, not general service privileges.
+-- PostgreSQL 17 gives a non-superuser role creator ADMIN, but not SET or
+-- INHERIT. Temporarily allow transfer and subsequent owner-only ACL changes.
+GRANT limiter_executor TO CURRENT_USER WITH SET TRUE, INHERIT TRUE;
 GRANT CREATE ON SCHEMA public TO limiter_executor;
 ALTER FUNCTION public.check_rate_limit_server(text, text, bigint, integer, boolean) OWNER TO limiter_executor;
 ALTER FUNCTION public.guest_usage_server(text[], boolean) OWNER TO limiter_executor;
@@ -91,6 +94,7 @@ REVOKE ALL ON FUNCTION public.check_rate_limit_server(text, text, bigint, intege
 REVOKE ALL ON FUNCTION public.guest_usage_server(text[], boolean) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.check_rate_limit_server(text, text, bigint, integer, boolean) TO service_role;
 GRANT EXECUTE ON FUNCTION public.guest_usage_server(text[], boolean) TO service_role;
+GRANT limiter_executor TO CURRENT_USER WITH SET FALSE, INHERIT FALSE;
 -- Public callers must not erase admission history through the old definer function.
 REVOKE ALL ON FUNCTION public.cleanup_old_rate_limits() FROM PUBLIC, anon, authenticated;
 CREATE OR REPLACE FUNCTION public.cleanup_old_rate_limits()

@@ -68,6 +68,8 @@ The migration removes all existing policies on this table, revokes direct PUBLIC
 
 Their `SECURITY DEFINER` owner is `limiter_executor`: NOLOGIN, no superuser or BYPASSRLS privileges, table-scoped SELECT/INSERT/DELETE, pinned empty search path. Browser roles cannot execute these RPCs or the legacy cleanup function. `lib/limiter-store.ts` is server-only and uses the existing service client without attaching a browser session. Missing service credentials fail closed.
 
+PostgreSQL 17 grants a non-superuser role creator ADMIN membership with SET and INHERIT disabled. Ownership transfer therefore temporarily enables SET and INHERIT for the migration executor, allowing both transfer and the subsequent function ACL changes. Both options are disabled again before commit; the target role's temporary schema CREATE grant is also revoked. The creator retains PostgreSQL's administrative membership, not runtime inheritance or SET access. All changes are transactional. Release preflight must still reject unexpected pre-existing target-role privileges or memberships.
+
 Admission performs bounded retention of up to 100 ordinary `ratelimit:*` records older than 31 days, beyond the maximum supported 30-day window. Guest allowance records never expire through this cleanup. The legacy service-only cleanup function is also bounded and excludes guest records.
 
 **Rollout prerequisite:** apply the migration through the approved deployment process and configure server-only `SUPABASE_SERVICE_ROLE_KEY`. Without either, fresh paid processing intentionally returns 503. This work does not apply production migrations or change production configuration.
@@ -84,14 +86,15 @@ npm run lint
 
 `npm test` runs Vitest route/UI tests plus the pre-existing `tsx --test` suites. Route tests execute exported handlers with mocked database/vendor counters. UI tests mount the real analysis-page orchestrator with browser/player child widgets stubbed. Translation tests execute the actual batch queue. SQL tests separately verify real PostgreSQL permissions and transaction behavior.
 
-Local database setup (Docker required):
+Local database test (Docker running and `postgres:17` available):
 
 ```bash
-docker run --name longcut-limiter-test -e POSTGRES_PASSWORD=local-test-only -d postgres:17
 npm run test:limiter-db
 ```
 
-The runner uses only `docker exec longcut-limiter-test`; it does not accept a database URL or load environment files. Each run creates a new test database. It loads the historical limiter table/policies from repository migrations, applies the new migration, and executes anonymous/authenticated denial, server persistence, read/write failure, recovery, retention, and concurrent admission checks. This is local PostgreSQL testing of the limiter migration, not a replay of all unrelated Supabase migrations.
+The runner creates a uniquely named disposable PostgreSQL container with no published ports, then removes it in `finally`. It does not accept a database URL or load environment files. A fresh cluster isolates roles as well as tables. Bootstrap uses the local superuser, but the migration connects as a NOSUPERUSER CREATEROLE/BYPASSRLS database/table/cleanup-function owner, with `public` owned by `pg_database_owner` and the target role absent.
+
+The fixture combines historical limiter policies with the observed production 48-hour public delete policy and 24-hour cleanup behavior. A failure injected immediately before COMMIT must restore policies, table/schema/function ACLs, cleanup definition, rows and memberships, and remove newly created functions/role. Successful migration must leave narrow function ownership/search paths and no executor SET/INHERIT or target schema CREATE privilege. Existing browser denial, server persistence, read/write failure, recovery, retention, and concurrency checks still run. This is a production-like local permission rehearsal, not an exact production schema replay or a replay of all unrelated Supabase migrations.
 
 ### Executed results — September 22, 2026 PDT
 
@@ -104,3 +107,9 @@ The runner uses only `docker exec longcut-limiter-test`; it does not accept a da
 | `git diff --check` | Passed |
 
 Standards and spec reviews ran separately. Follow-up reviews found no remaining blocking findings after fixes for persistence transport errors, translation queue handling, preview timeout, cached-content visibility, retention, and sanitized save diagnostics.
+
+### Ownership repair verification — September 24, 2026 PDT
+
+The earlier superuser-only database tests missed the ownership-transfer failure found during release preflight. The updated runner first reproduced `must be able to SET ROLE "limiter_executor"` against the original migration, then passed after the temporary-membership repair, including rollback and post-commit privilege assertions.
+
+Clean tracked-source validation used an isolated temporary workspace and `npm ci --no-audit --no-fund` (744 packages), without copying installed dependencies or local environment files. Results: 60 Vitest + 51 existing tests passed; TypeScript passed; lint reported zero errors and five existing warnings; production build passed compilation, type checking, and all 42 static pages. Build used a sanitized environment, localhost/dummy Supabase settings, no provider credentials, and real font fetching (no font mocks). This establishes a clean-install build, not production integration health. Final local database regression and script lint also passed after the fixture update. No release or production mutation was performed.
