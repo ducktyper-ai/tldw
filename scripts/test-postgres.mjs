@@ -39,16 +39,21 @@ export function startTestPostgres(kind) {
   }
   try {
     mkdirSync(socket, { mode: 0o700 });
-    execFileSync(join(bin, 'initdb'), ['-D', data, '-A', 'trust', '-U', 'postgres', '--no-locale', '-E', 'UTF8'], { stdio: 'pipe' });
+    execFileSync(join(bin, 'initdb'), ['-D', data, '-A', 'trust', '-U', 'postgres', '--no-locale', '-E', 'UTF8'], { encoding: 'utf8' });
     writeFileSync(join(data, 'postgresql.auto.conf'), [
       "listen_addresses = ''", `unix_socket_directories = '${socket}'`,
       'unix_socket_permissions = 0700', "shared_buffers = '16MB'", 'max_connections = 40',
     ].join('\n') + '\n');
-    execFileSync(join(bin, 'pg_ctl'), ['-D', data, '-l', join(root, 'postgres.log'), '-w', '-t', '30', 'start'], { stdio: 'pipe' });
+    execFileSync(join(bin, 'pg_ctl'), ['-D', data, '-l', join(root, 'postgres.log'), '-w', '-t', '30', 'start'], { encoding: 'utf8' });
     started = true;
     writeFileSync(join(root, 'test-cluster.json'), JSON.stringify({ kind, bin }), { mode: 0o600 });
     return { ...connection(root, bin, kind), env: { ...process.env, LONGCUT_TEST_PG_ROOT: root }, stop };
   } catch (error) {
+    // Retain the server's actual failure before deleting the disposable cluster.
+    try {
+      const log = readFileSync(join(root, 'postgres.log'), 'utf8');
+      if (error instanceof Error) error.message += '\nPostgreSQL startup log:\n' + log;
+    } catch { /* The server may have failed before opening its log. */ }
     // pg_ctl can time out after starting the server. Stop it before removing data.
     try { execFileSync(join(bin, 'pg_ctl'), ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' }); } catch {}
     rmSync(root, { recursive: true, force: true });
