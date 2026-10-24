@@ -5,7 +5,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 const state = vi.hoisted(() => ({
   cacheStatus: 503, limitStatus: 200, paidStatus: 200, cache: null as any,
   failNetwork: false, requests: [] as string[], paid: vi.fn(),
-  saveFails: false,
+  saveFails: false, transcriptError: null as any,
+  persist: null as null | ((options?: RequestInit) => Promise<Response>),
   search: new URLSearchParams(),
 }));
 vi.mock('next/navigation', () => ({
@@ -18,14 +19,23 @@ vi.mock('@/lib/hooks/use-translation', () => ({ useTranslation: () => ({ transla
 vi.mock('@/lib/hooks/use-subscription', () => ({ useSubscription: () => ({}) }));
 vi.mock('@/lib/hooks/use-transcript-export', () => ({ useTranscriptExport: () => ({}) }));
 vi.mock('@/lib/notes-client', () => ({ fetchNotes: async () => [], saveNote: vi.fn() }));
-vi.mock('@/lib/csrf-client', () => ({ csrfFetch: { post: async () => {
+vi.mock('@/lib/csrf-client', () => ({ csrfFetch: { post: async (url: string, _body: unknown, options?: RequestInit) => {
+  if (url === '/api/analysis-intents') return fetch(url, { ...options, method: 'POST' });
+  if (state.persist) return state.persist(options);
   if (state.saveFails) throw new Error('connection refused');
   return Response.json({});
 } } }));
-vi.mock('@/components/right-column-tabs', () => ({ RightColumnTabs: () => <div>Transcript workspace</div> }));
+vi.mock('@/components/right-column-tabs', () => ({ RightColumnTabs: ({ availableLanguages, videoInfo }: any) => <div>
+  Transcript workspace
+  <span data-testid="cached-language">{videoInfo?.language ?? 'unknown'}</span>
+  <span data-testid="cached-languages">{(availableLanguages ?? []).join(',')}</span>
+</div> }));
 vi.mock('@/components/youtube-player', () => ({ YouTubePlayer: () => null }));
-vi.mock('@/components/highlights-panel', () => ({ HighlightsPanel: ({ onGenerateHighlights }: any) => <button onClick={onGenerateHighlights}>Generate highlights</button> }));
-vi.mock('@/components/theme-selector', () => ({ ThemeSelector: () => null }));
+vi.mock('@/components/highlights-panel', () => ({ HighlightsPanel: ({ onGenerateHighlights, isGeneratingHighlights }: any) => <button disabled={isGeneratingHighlights} onClick={onGenerateHighlights}>Generate highlights</button> }));
+vi.mock('@/components/theme-selector', () => ({ ThemeSelector: ({ onSelect }: any) => <>
+  <button onClick={() => onSelect('First theme')}>First theme</button>
+  <button onClick={() => onSelect('Second theme')}>Second theme</button>
+</> }));
 vi.mock('@/components/loading-context', () => ({ LoadingContext: () => null }));
 vi.mock('@/components/loading-tips', () => ({ LoadingTips: () => null }));
 vi.mock('@/components/video-skeleton', () => ({ VideoSkeleton: () => null }));
@@ -43,8 +53,9 @@ const cached = (summary: string | null = 'Existing summary') => ({
 });
 beforeEach(() => {
   Object.assign(state, { cacheStatus: 503, limitStatus: 200, paidStatus: 200,
-    cache: null, failNetwork: false, saveFails: false, requests: [], search: new URLSearchParams() });
+    cache: null, failNetwork: false, saveFails: false, persist: null, transcriptError: null, requests: [], search: new URLSearchParams() });
   vi.clearAllMocks();
+  sessionStorage.clear();
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
@@ -57,11 +68,13 @@ beforeEach(() => {
     }
     if (url === '/api/check-limit') return Response.json({ canGenerate: true }, { status: state.limitStatus });
     if (url === '/api/video-info') return Response.json({ title: 'Test video', duration: 10 });
+    if (url === '/api/analysis-intents') return Response.json({ flowId: '00000000-0000-4000-8000-000000000001' });
     state.paid(url);
-    return Response.json({ transcript, topics: [], summaryContent: 'Summary', preview: 'Preview' }, { status: state.paidStatus });
+    if (url === '/api/transcript' && state.transcriptError) return Response.json(state.transcriptError.body, { status: state.transcriptError.status });
+    return Response.json({ transcript, topics: [], summaryContent: 'Summary', preview: 'Preview' }, { status: url === '/api/suggested-questions' ? 200 : state.paidStatus });
   }));
 });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 it.each([402, 403, 500, 503])('cache HTTP %s stops automatic generation; retry is explicit', async status => {
   state.cacheStatus = status;
@@ -92,22 +105,63 @@ it.each([false, true])('required preflight failure stops missing content (cached
   state.cache = isCached ? cached(null) : null;
   state.limitStatus = 503;
   render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: isCached ? 'Generate missing summary' : 'Analyze video' }));
   await screen.findByRole('heading', { name: 'Service temporarily unavailable' });
   expect(state.paid).not.toHaveBeenCalled();
   expect(Boolean(screen.queryByText('Transcript workspace'))).toBe(isCached);
 });
 
-it('real miss with healthy dependencies reaches transcript and AI', async () => {
+it('real miss stays passive; deliberate action reaches transcript and AI', async () => {
   state.cacheStatus = 200;
   render(<AnalyzePage />);
+  const start = await screen.findByRole('button', { name: 'Analyze video' });
+  expect(state.paid).not.toHaveBeenCalled();
+  fireEvent.click(start);
   await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/generate-summary'));
   expect(state.paid).toHaveBeenCalledWith('/api/transcript');
+});
+
+it('cached missing summary stays public and passive until explicitly requested', async () => {
+  state.cacheStatus = 200; state.cache = cached(null);
+  render(<AnalyzePage />);
+  await screen.findByText('Transcript workspace');
+  const start = await screen.findByRole('button', { name: 'Generate missing summary' });
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
+  expect(state.paid).not.toHaveBeenCalled();
+  fireEvent.click(start);
+  await waitFor(() => expect(state.paid.mock.calls).toEqual([['/api/generate-summary']]));
+});
+
+it.each([false, true])('cached visits and reloads reuse language metadata with no transcript request (legacy=%s)', async legacy => {
+  state.cacheStatus = 200;
+  state.cache = cached();
+  if (!legacy) Object.assign(state.cache.videoInfo, { language: 'es', availableLanguages: ['es', 'en'] });
+  for (let visit = 0; visit < 2; visit++) {
+    const view = render(<AnalyzePage />);
+    await screen.findByText('Transcript workspace');
+    expect(screen.getByTestId('cached-language').textContent).toBe(legacy ? 'unknown' : 'es');
+    expect(screen.getByTestId('cached-languages').textContent).toBe(legacy ? '' : 'es,en');
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
+    expect(state.requests).not.toContain('/api/transcript');
+    expect(state.paid).not.toHaveBeenCalled();
+    view.unmount();
+  }
+});
+
+it('one-shot server intent from explicit URL submission continues without a second click', async () => {
+  state.cacheStatus = 200;
+  sessionStorage.setItem('analysis-intent:abcdefghijk', '00000000-0000-4000-8000-000000000001');
+  render(<AnalyzePage />);
+  await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/generate-summary'));
+  expect(state.requests).not.toContain('/api/analysis-intents');
+  expect(sessionStorage.getItem('analysis-intent:abcdefghijk')).toBeNull();
 });
 
 it('forced regeneration still requires preflight', async () => {
   state.search = new URLSearchParams('regen=1');
   state.limitStatus = 503;
   render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Analyze video' }));
   await screen.findByRole('heading', { name: 'Service temporarily unavailable' });
   expect(state.paid).not.toHaveBeenCalled();
 });
@@ -121,6 +175,255 @@ it('explicit highlight generation can proceed from a healthy cache hit', async (
   await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/video-analysis'));
 });
 
+it('revealing existing cached highlights never generates missing questions', async () => {
+  state.cacheStatus = 200;
+  state.cache = { ...cached(), topics: [{ id: 'cached', title: 'Cached topic', segments: [], duration: 0 }] };
+  render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
+  expect(state.paid).not.toHaveBeenCalled();
+  expect(state.requests).not.toContain('/api/analysis-intents');
+});
+
+it('missing-summary intent does not leak into successive explicit cached theme requests', async () => {
+  state.cacheStatus = 200;
+  state.cache = { ...cached(null), topics: [{ id: 'cached', title: 'Cached topic', segments: [], duration: 0 }], themes: ['First theme', 'Second theme'] };
+  render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate missing summary' }));
+  await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/generate-summary'));
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
+  for (const theme of ['First theme', 'Second theme']) {
+    fireEvent.click(await screen.findByRole('button', { name: theme }));
+    await waitFor(() => {
+      const request = vi.mocked(fetch).mock.calls.find(([url, options]) => url === '/api/video-analysis' && JSON.parse(String(options?.body)).theme === theme);
+      expect(request).toBeTruthy();
+      expect(new Headers(request?.[1]?.headers).has('x-analysis-flow')).toBe(false);
+      expect(new Headers(request?.[1]?.headers).has('x-analysis-video')).toBe(false);
+    });
+  }
+  expect(state.paid.mock.calls.filter(([url]) => url === '/api/video-analysis')).toHaveLength(2);
+});
+
+it('unmount during highlight admission cancels intent and prevents downstream paid calls', async () => {
+  state.cacheStatus = 200; state.cache = cached();
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  let finishAdmission!: (response: Response) => void;
+  let admissionSignal: AbortSignal | null | undefined;
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === '/api/analysis-intents') {
+      admissionSignal = options?.signal;
+      // Deliberately emulate a response that wins the abort race.
+      return new Promise(resolve => { finishAdmission = resolve; });
+    }
+    return originalFetch(input, options);
+  });
+  const view = render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
+  await waitFor(() => expect(finishAdmission).toBeTypeOf('function'));
+  view.unmount();
+  await act(async () => { finishAdmission(Response.json({ flowId: '00000000-0000-4000-8000-000000000001' })); });
+  expect(state.paid).not.toHaveBeenCalled();
+  expect(admissionSignal?.aborted).toBe(true);
+});
+
+it('pending optional questions do not block highlights; unmount cancels questions and prevents persistence', async () => {
+  state.cacheStatus = 200; state.cache = cached();
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  let finish!: (response: Response) => void;
+  let signal: AbortSignal | null | undefined;
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === '/api/suggested-questions') {
+      signal = options?.signal;
+      return new Promise(resolve => { finish = resolve; });
+    }
+    return originalFetch(input, options);
+  });
+  const view = render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
+  await waitFor(() => expect(finish).toBeTypeOf('function'));
+  await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/video-analysis'));
+  view.unmount();
+  await act(async () => { finish(Response.json({ questions: [] })); });
+  expect(state.paid.mock.calls.filter(([url]) => url === '/api/video-analysis')).toHaveLength(1);
+  expect(signal?.aborted).toBe(true);
+});
+
+it('first delayed deliberate highlight click renews server-rejected stale intent once', async () => {
+  state.cacheStatus = 200;
+  sessionStorage.setItem('analysis-intent:abcdefghijk', 'expired-flow');
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  const highlights: string[] = [];
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === '/api/video-analysis') {
+      const flow = new Headers(options?.headers).get('x-analysis-flow')!;
+      highlights.push(flow);
+      if (flow === 'expired-flow') return Promise.resolve(Response.json({ code: 'ANALYSIS_INTENT_REQUIRED' }, { status: 409 }));
+    }
+    return originalFetch(input, options);
+  });
+  render(<AnalyzePage />);
+  await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/generate-summary'));
+  expect(state.requests).not.toContain('/api/analysis-intents');
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
+  await waitFor(() => expect(highlights).toEqual(['expired-flow', '00000000-0000-4000-8000-000000000001']));
+  expect(state.requests.filter(url => url === '/api/analysis-intents')).toHaveLength(1);
+});
+
+it('optional persistence has its own deadline and cannot hold primary highlights open', async () => {
+  vi.useFakeTimers(); state.cacheStatus = 200; state.cache = cached();
+  let persistenceSignal!: AbortSignal;
+  state.persist = options => { persistenceSignal = options!.signal!; return new Promise(() => {}); };
+  render(<AnalyzePage />);
+  await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Generate highlights' })); });
+  expect(persistenceSignal).toBeDefined();
+  expect(persistenceSignal.aborted).toBe(false);
+  expect(state.paid).toHaveBeenCalledWith('/api/video-analysis');
+  expect((screen.getByRole('button', { name: 'Generate highlights' }) as HTMLButtonElement).disabled).toBe(false);
+  await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+  expect(persistenceSignal.aborted).toBe(true);
+  expect(screen.queryByRole('heading', { name: 'Service temporarily unavailable' })).toBeNull();
+});
+
+it('optional questions deadline remains independent after primary highlights complete', async () => {
+  vi.useFakeTimers(); state.cacheStatus = 200; state.cache = cached();
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  let questionSignal!: AbortSignal;
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === '/api/suggested-questions') {
+      questionSignal = options!.signal!; return new Promise(() => {});
+    }
+    return originalFetch(input, options);
+  });
+  render(<AnalyzePage />); await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Generate highlights' })); });
+  expect(state.paid).toHaveBeenCalledWith('/api/video-analysis');
+  expect((screen.getByRole('button', { name: 'Generate highlights' }) as HTMLButtonElement).disabled).toBe(false);
+  expect(questionSignal.aborted).toBe(false);
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(questionSignal.aborted).toBe(true);
+  expect(screen.queryByRole('heading', { name: 'Service temporarily unavailable' })).toBeNull();
+});
+
+it.each([429, 503])('deliberate highlight denial %s never renews intent or retries paid work', async status => {
+  state.cacheStatus = 200; state.cache = cached(); state.paidStatus = status;
+  render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
+  await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/video-analysis'));
+  await act(async () => {});
+  expect(state.requests.filter(url => url === '/api/analysis-intents')).toHaveLength(1);
+  expect(state.paid.mock.calls.filter(([url]) => url === '/api/video-analysis')).toHaveLength(1);
+});
+
+it('expired capability renewal is bounded to one attempt within the deliberate action', async () => {
+  state.cacheStatus = 200;
+  sessionStorage.setItem('analysis-intent:abcdefghijk', 'expired-flow');
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  const denied = vi.fn();
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === '/api/video-analysis') {
+      denied(); return Promise.resolve(Response.json({ code: 'ANALYSIS_INTENT_REQUIRED', error: 'Intent expired' }, { status: 409 }));
+    }
+    return originalFetch(input, options);
+  });
+  render(<AnalyzePage />);
+  await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/generate-summary'));
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
+  await waitFor(() => expect(denied).toHaveBeenCalledTimes(2));
+  await act(async () => {});
+  expect(state.requests.filter(url => url === '/api/analysis-intents')).toHaveLength(1);
+  expect((screen.getByRole('button', { name: 'Generate highlights' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it.each([false, true])('unmount during initial admission prevents missing-content dispatch (cached=%s)', async isCached => {
+  state.cacheStatus = 200; state.cache = isCached ? cached(null) : null;
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  let finish!: (response: Response) => void;
+  let signal: AbortSignal | null | undefined;
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === '/api/analysis-intents') {
+      signal = options?.signal;
+      return new Promise(resolve => { finish = resolve; });
+    }
+    return originalFetch(input, options);
+  });
+  const view = render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: isCached ? 'Generate missing summary' : 'Analyze video' }));
+  await waitFor(() => expect(finish).toBeTypeOf('function'));
+  view.unmount();
+  await act(async () => { finish(Response.json({ flowId: 'flow' })); });
+  expect(state.paid).not.toHaveBeenCalled();
+  expect(signal?.aborted).toBe(true);
+});
+
+it.each(['timeout', 'unmount'])('late acquisition response after %s cannot start preview or summary', async cancellation => {
+  vi.useFakeTimers();
+  state.cacheStatus = 200;
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  let finish!: (response: Response) => void;
+  let acquisitionSignal: AbortSignal | null | undefined;
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === '/api/transcript') {
+      acquisitionSignal = options?.signal;
+      return new Promise(resolve => { finish = resolve; });
+    }
+    return originalFetch(input, options);
+  });
+  const view = render(<AnalyzePage />);
+  await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Analyze video' })); });
+  expect(finish).toBeTypeOf('function');
+  if (cancellation === 'timeout') await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  else view.unmount();
+  await act(async () => { finish(Response.json({ transcript })); });
+  expect(state.paid).not.toHaveBeenCalledWith('/api/quick-preview');
+  expect(state.paid).not.toHaveBeenCalledWith('/api/generate-summary');
+  expect(acquisitionSignal?.aborted).toBe(true);
+  if (cancellation === 'timeout') expect(screen.getByRole('button', { name: 'Try again' })).toBeTruthy();
+});
+
+it.each(['/api/check-video-cache', '/api/analysis-intents'])('initialization timeout at %s exposes deliberate retry', async pendingUrl => {
+  vi.useFakeTimers(); state.cacheStatus = 200;
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === pendingUrl) return new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true });
+    });
+    return originalFetch(input, options);
+  });
+  render(<AnalyzePage />);
+  await act(async () => {});
+  if (pendingUrl === '/api/analysis-intents') await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Analyze video' })); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(screen.getByText(/Analysis initialization timed out/)).toBeTruthy();
+  const retry = screen.getByRole('button', { name: 'Try again' });
+  expect(state.paid).not.toHaveBeenCalled();
+  vi.mocked(fetch).mockImplementation(originalFetch);
+  await act(async () => { fireEvent.click(retry); });
+  expect(state.paid).toHaveBeenCalledWith('/api/generate-summary');
+});
+
+it.each(['/api/transcript', '/api/video-info'])('deadline during %s body parsing prevents new AI dispatch', async pendingUrl => {
+  vi.useFakeTimers(); state.cacheStatus = 200;
+  const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+  let finishBody!: (body: unknown) => void;
+  vi.mocked(fetch).mockImplementation((input, options) => {
+    if (String(input) === pendingUrl) return Promise.resolve(Object.assign(Response.json({}), {
+      json: () => new Promise(resolve => { finishBody = resolve; }),
+    }));
+    return originalFetch(input, options);
+  });
+  render(<AnalyzePage />);
+  await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Analyze video' })); });
+  expect(finishBody).toBeTypeOf('function');
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  await act(async () => { finishBody(pendingUrl === '/api/transcript' ? { transcript } : { title: 'Late metadata', duration: 10 }); });
+  expect(state.paid).not.toHaveBeenCalledWith('/api/quick-preview');
+  expect(state.paid).not.toHaveBeenCalledWith('/api/generate-summary');
+  expect(screen.getByRole('button', { name: 'Try again' })).toBeTruthy();
+});
+
 it('persistence failure response suppresses follow-up questions and retry loops', async () => {
   state.cacheStatus = 200;
   state.cache = cached();
@@ -129,7 +432,7 @@ it('persistence failure response suppresses follow-up questions and retry loops'
   fireEvent.click(await screen.findByRole('button', { name: 'Generate highlights' }));
   await screen.findByRole('heading', { name: 'Service temporarily unavailable' });
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
-  expect(state.paid.mock.calls).toEqual([['/api/video-analysis']]);
+  expect(state.paid.mock.calls).toEqual([['/api/suggested-questions'], ['/api/video-analysis']]);
 });
 
 it('rejected post-provider persistence stops additional paid work, preserving transcript', async () => {
@@ -137,9 +440,34 @@ it('rejected post-provider persistence stops additional paid work, preserving tr
   state.cache = cached(null);
   state.saveFails = true;
   render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Generate missing summary' }));
   await screen.findByRole('heading', { name: 'Service temporarily unavailable' });
   expect(screen.getByText('Transcript workspace')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Generate highlights' }));
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
   expect(state.paid.mock.calls).toEqual([['/api/generate-summary']]);
+});
+
+it.each([
+  [429, 'TRANSCRIPT_SPEND_THROTTLED', 'Fresh transcript requests paused'],
+  [403, 'TRANSCRIPT_ELIGIBILITY_REQUIRED', 'Video allowance required'],
+  [404, 'TRANSCRIPT_UNAVAILABLE', 'Captions unavailable'],
+  [502, 'TRANSCRIPT_DEPENDENCY_FAILURE', 'Transcript service unavailable'],
+  [504, 'TRANSCRIPT_UNKNOWN_UPSTREAM_ACCEPTANCE', 'Transcript request not confirmed'],
+])('distinguishes transcript failure %s and retries only on explicit action', async (status, code, heading) => {
+  state.cacheStatus = 200;
+  state.transcriptError = { status, body: { code, error: 'Request could not finish.', noCreditsUsed: true,
+    ...(status === 429 ? { resetAt: '2030-01-01T00:00:00Z' } : {}) } };
+  const view = render(<AnalyzePage />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Analyze video' }));
+  await screen.findByRole('heading', { name: heading });
+  expect(screen.getByText(/No Longcut video allowance was used/)).toBeTruthy();
+  if (status === 429) expect(screen.getByText(/Try again after/)).toBeTruthy();
+  expect(state.paid.mock.calls).toEqual([['/api/transcript']]);
+  view.rerender(<AnalyzePage />);
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
+  expect(state.paid.mock.calls).toHaveLength(1);
+  state.transcriptError = null;
+  fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+  await waitFor(() => expect(state.paid).toHaveBeenCalledWith('/api/generate-summary'));
 });

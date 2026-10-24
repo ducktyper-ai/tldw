@@ -1,22 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { withInitialAnalysis } from '@/lib/initial-analysis-spend';
 import { extractVideoId } from '@/lib/utils';
 import { withSecurity, SECURITY_PRESETS } from '@/lib/security-middleware';
 import { shouldUseMockData, getMockTranscript } from '@/lib/mock-data';
 import { mergeTranscriptSegmentsIntoSentences } from '@/lib/transcript-sentence-merger';
 import { NO_CREDITS_USED_MESSAGE } from '@/lib/no-credits-message';
 import { fetchYouTubeTranscript } from '@/lib/youtube-transcript-provider';
+import { fetchSupadataTranscript } from '@/lib/supadata-transcript-provider';
+import { transcriptEligibility, reserveTranscriptSpend, transitionTranscriptSpend } from '@/lib/transcript-spend';
+import { setGuestCookies } from '@/lib/guest-usage';
+import { DependencyUnavailableError } from '@/lib/dependency-unavailable';
+import { assertTranscriptCacheOwner, reuseTranscript } from '@/lib/transcript-cache';
 
 function respondWithNoCredits(
   payload: Record<string, unknown>,
-  status: number
+  status: number,
+  requestId: string
 ) {
   return NextResponse.json(
     {
       ...payload,
+      requestId,
       creditsMessage: NO_CREDITS_USED_MESSAGE,
+      creditsScope: 'longcut_allowance',
       noCreditsUsed: true
     },
-    { status }
+    { status, headers: { 'x-request-id': requestId, 'Cache-Control': 'no-store',
+      ...(typeof payload.retryAfter === 'number' ? { 'Retry-After': String(payload.retryAfter) } : {}) } }
   );
 }
 
@@ -28,17 +38,24 @@ function calculateTranscriptDuration(segments: { start: number; duration: number
 }
 
 async function handler(request: NextRequest) {
+  const requestId = crypto.randomUUID();
   try {
-    const { url, lang, expectedDuration } = await request.json();
+    request.signal.throwIfAborted();
+    const { url, lang: requestedLang, expectedDuration } = await request.json();
+    if (typeof url !== 'string' || (requestedLang !== undefined &&
+      (typeof requestedLang !== 'string' || !/^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$/.test(requestedLang)))) {
+      return respondWithNoCredits({ error: 'Invalid transcript request' }, 400, requestId);
+    }
+    const lang: string | undefined = requestedLang?.toLowerCase();
 
     if (!url) {
-      return respondWithNoCredits({ error: 'YouTube URL is required' }, 400);
+      return respondWithNoCredits({ error: 'YouTube URL is required' }, 400, requestId);
     }
 
     const videoId = extractVideoId(url);
 
     if (!videoId) {
-      return respondWithNoCredits({ error: 'Invalid YouTube URL' }, 400);
+      return respondWithNoCredits({ error: 'Invalid YouTube URL' }, 400, requestId);
     }
 
     if (shouldUseMockData()) {
@@ -78,6 +95,20 @@ async function handler(request: NextRequest) {
       });
     }
 
+    const eligibility = await transcriptEligibility();
+    const respond = (payload: Record<string, unknown>, status: number) => {
+      const response = respondWithNoCredits(payload, status, requestId);
+      if (eligibility.guest) setGuestCookies(response, eligibility.guest);
+      return response;
+    };
+    if (!eligibility.allowed) {
+      return respond({ code: 'TRANSCRIPT_ELIGIBILITY_REQUIRED', reason: eligibility.reason,
+        requiresAuth: eligibility.requiresAuth,
+        error: eligibility.requiresAuth ? 'Sign in to request another fresh transcript.'
+          : 'Your current video allowance or subscription does not permit fresh processing. Transcript requests do not spend a video credit.',
+      }, eligibility.requiresAuth ? 401 : 403);
+    }
+
     // ── Strategy: Try YouTube direct first (free), fall back to Supadata (paid) ──
     // YouTube's InnerTube API is free but gets blocked from datacenter IPs.
     // Supadata is a paid API that handles YouTube's bot detection for us.
@@ -91,7 +122,7 @@ async function handler(request: NextRequest) {
     // ── Attempt 1: YouTube InnerTube API (free) ──
     console.log(`[TRANSCRIPT] Trying YouTube direct for ${videoId} (lang=${lang ?? 'auto'})`);
     try {
-      const ytResult = await fetchYouTubeTranscript(videoId, lang, expectedDuration);
+      const ytResult = await fetchYouTubeTranscript(videoId, lang, expectedDuration, request.signal);
       if (ytResult && ytResult.segments.length > 0) {
         rawSegments = ytResult.segments;
         language = ytResult.language;
@@ -100,6 +131,7 @@ async function handler(request: NextRequest) {
         console.log(`[TRANSCRIPT] YouTube direct succeeded: ${rawSegments.length} segments, lang=${language}`);
       }
     } catch (ytError) {
+      request.signal.throwIfAborted();
       console.warn(`[TRANSCRIPT] YouTube direct failed:`, ytError instanceof Error ? ytError.message : String(ytError));
     }
 
@@ -107,52 +139,45 @@ async function handler(request: NextRequest) {
     if (!rawSegments || rawSegments.length === 0) {
       const supadataKey = process.env.SUPADATA_API_KEY;
       if (supadataKey) {
-        console.log(`[TRANSCRIPT] Falling back to Supadata for ${videoId}`);
         source = 'supadata';
-        try {
-          const apiUrl = new URL('https://api.supadata.ai/v1/transcript');
-          apiUrl.searchParams.set('url', `https://www.youtube.com/watch?v=${videoId}`);
-          if (lang) apiUrl.searchParams.set('lang', lang);
-
-          const supadataResp = await fetch(apiUrl.toString(), {
-            method: 'GET',
-            headers: { 'x-api-key': supadataKey, 'Content-Type': 'application/json' },
-          });
-
-          if (supadataResp.ok) {
-            const body = await supadataResp.json() as Record<string, unknown>;
-            const content = Array.isArray(body?.content) ? body.content
-              : Array.isArray(body?.transcript) ? body.transcript
-              : Array.isArray(body) ? body : null;
-
-            if (content && content.length > 0) {
-              // Supadata returns timestamps in either ms or seconds — detect and normalize
-              const sampleSize = Math.min(5, content.length);
-              let totalOffset = 0;
-              let offsetCount = 0;
-              for (let i = 0; i < sampleSize; i++) {
-                const val = content[i].offset ?? content[i].start ?? 0;
-                if (val > 0) { totalOffset += val; offsetCount++; }
-              }
-              const isMs = offsetCount > 0 && (totalOffset / offsetCount) > 500;
-
-              rawSegments = content.map((item: any) => ({
-                text: (item.text || item.content || '').replace(/^>>\s*/gm, ''),
-                start: isMs ? ((item.offset ?? item.start ?? 0) / 1000) : (item.offset ?? item.start ?? 0),
-                duration: isMs ? ((item.duration ?? 0) / 1000) : (item.duration ?? 0),
-              }));
-              language = typeof body?.lang === 'string' ? body.lang : undefined;
-              availableLanguages = Array.isArray(body?.availableLangs)
-                ? (body.availableLangs as unknown[]).filter((l): l is string => typeof l === 'string')
-                : undefined;
-              console.log(`[TRANSCRIPT] Supadata fallback succeeded: ${rawSegments!.length} segments`);
-            }
-          } else {
-            console.warn(`[TRANSCRIPT] Supadata returned ${supadataResp.status}`);
-          }
-        } catch (supErr) {
-          console.error(`[TRANSCRIPT] Supadata fallback failed:`, supErr instanceof Error ? supErr.message : String(supErr));
+        await assertTranscriptCacheOwner();
+        const admission = await reserveTranscriptSpend(eligibility, videoId, lang);
+        if (!admission.allowed) {
+          if (admission.reason === 'guest_used') return respond({ code: 'TRANSCRIPT_ELIGIBILITY_REQUIRED',
+            requiresAuth: true, error: 'Sign in to request another fresh transcript.' }, 401);
+          const retryAfter = Math.max(1, Math.ceil((Date.parse(admission.resetAt) - Date.now()) / 1000));
+          return respond({ code: 'TRANSCRIPT_SPEND_THROTTLED', reason: admission.reason,
+            error: admission.reason === 'cooldown' ? 'A transcript request may still be processing. Please wait before retrying.'
+              : 'Fresh transcript requests are temporarily limited. Cached videos remain available.',
+            resetAt: admission.resetAt, retryAfter, retryable: true,
+          }, 429);
         }
+        if (request.signal.aborted) {
+          await transitionTranscriptSpend(admission.reservationId, 'release');
+          return respond({ code: 'TRANSCRIPT_DEPENDENCY_FAILURE', error: 'Transcript request cancelled before dispatch.' }, 503);
+        }
+        // Commit possible dispatch BEFORE invoking the provider. No refund after this boundary.
+        await assertTranscriptCacheOwner(true);
+        await transitionTranscriptSpend(admission.reservationId, 'dispatch');
+        const result = await fetchSupadataTranscript({ videoId, lang, apiKey: supadataKey, requestId, signal: request.signal });
+        await transitionTranscriptSpend(admission.reservationId,
+          result.outcome === 'unknown_upstream_acceptance' ? 'uncertain' : 'complete');
+        if (result.outcome !== 'success') {
+          const error = result.outcome === 'unavailable'
+            ? 'No existing captions are available for this video.'
+            : result.reason === 'unexpected_job'
+              ? 'The transcript provider unexpectedly accepted background work. No transcript is available; Longcut will not automatically resubmit this request.'
+              : result.outcome === 'unknown_upstream_acceptance'
+                ? 'The transcript request did not complete. The provider may have accepted work; Longcut will not automatically resubmit this request.'
+                : 'The transcript provider could not return usable captions.';
+          return respond({
+            error, code: `TRANSCRIPT_${result.outcome.toUpperCase()}`, outcome: result.outcome,
+            reason: result.reason, source, retryable: false,
+          }, result.outcome === 'unavailable' ? 404 : result.reason === 'timeout' ? 504 : 502);
+        }
+        rawSegments = result.segments;
+        language = result.language;
+        availableLanguages = result.availableLanguages;
       } else {
         console.warn(`[TRANSCRIPT] YouTube direct failed and no SUPADATA_API_KEY configured`);
       }
@@ -161,8 +186,10 @@ async function handler(request: NextRequest) {
     // ── Both methods failed ──
     if (!rawSegments || rawSegments.length === 0) {
       return respondWithNoCredits(
-        { error: 'No transcript available for this video. The video may not have subtitles enabled.' },
-        404
+        { error: 'The transcript service is unavailable. Existing captions could not be checked.',
+          code: 'TRANSCRIPT_DEPENDENCY_FAILURE', outcome: 'dependency_failure' },
+        502,
+        requestId
       );
     }
 
@@ -209,8 +236,11 @@ async function handler(request: NextRequest) {
         : 0
     });
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       videoId,
+      requestId,
+      source,
+      outcome: 'success',
       transcript: transformedTranscript,
       language,
       availableLanguages,
@@ -220,15 +250,20 @@ async function handler(request: NextRequest) {
       rawSegmentCount: rawSegments.length,
       isPartial,
       coverageRatio: coverageRatio ? Math.round(coverageRatio * 100) : undefined
-    });
+    }, { headers: { 'x-request-id': requestId } });
+    if (eligibility.guest) setGuestCookies(response, eligibility.guest);
+    return response;
   } catch (error) {
+    if (error instanceof DependencyUnavailableError) throw error;
+    if (request.signal.aborted) return respondWithNoCredits({ code: 'TRANSCRIPT_DEPENDENCY_FAILURE',
+      error: 'Transcript request cancelled or timed out.' }, 503, requestId);
     console.error('[TRANSCRIPT] Error processing transcript:', {
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
       type: error?.constructor?.name
     });
-    return respondWithNoCredits({ error: 'Failed to fetch transcript' }, 500);
+    return respondWithNoCredits({ error: 'Failed to fetch transcript' }, 500, requestId);
   }
 }
 
-export const POST = withSecurity(handler, SECURITY_PRESETS.PAID);
+export const POST = withSecurity(withInitialAnalysis('transcript', handler, { reuse: reuseTranscript }), SECURITY_PRESETS.PAID);

@@ -38,14 +38,22 @@ vi.mock('@/lib/supabase/server', () => ({ createClient: async () => ({
   },
 }) }));
 vi.mock('@/lib/supabase/admin', () => ({ createServiceRoleClient: () => ({
-  rpc: async (name: string, args: any) => {
+  rpc: (name: string, args: any) => {
+    const result = (async () => {
     state.rpc(name, args);
     if (name === 'check_rate_limit_server') return {
       data: { allowed: state.limiterAllowed, remaining: 2, reset_at: new Date().toISOString(), retry_after: 60 },
       error: state.limiterError,
     };
     if (name === 'guest_usage_server') return { data: state.guestUsed || args.p_record, error: state.guestError };
+    if (name === 'reserve_transcript_spend') return { data: { allowed: true, reservation_id: 'test-reservation' }, error: null };
+    if (name === 'transition_transcript_spend') return { data: true, error: null };
+    if (name === 'validate_initial_analysis_flow' || name === 'transcript_cache_assert_owner' || name === 'transcript_cache_finish') return { data: true, error: null };
+    if (name === 'transcript_cache_acquire') return { data: { state: 'leader', owner: '00000000-0000-4000-8000-000000000002' }, error: null };
+    if (name === 'claim_initial_analysis_operation' || name === 'finish_initial_analysis_operation') return { data: true, error: null };
     throw new Error(`Unexpected service RPC ${name}`);
+    })();
+    return Object.assign(result, { abortSignal: () => result });
   },
 }) }));
 vi.mock('@/lib/ai-processing', () => ({ generateTopicsFromTranscript: state.topics, generateThemesFromTranscript: state.themes }));
@@ -86,7 +94,8 @@ const payload = {
   transcript: [{ text: 'A useful insight.', start: 0, duration: 10 }],
 };
 const request = (path: string, body = payload) => new NextRequest(`http://localhost/api/${path}`, {
-  method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' },
+  method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json',
+    'x-analysis-flow': '00000000-0000-4000-8000-000000000001', 'x-analysis-video': 'abcdefghijk' },
 });
 const failure = { code: 'exceed_db_size_quota', message: 'sensitive body and credentials' };
 const noPaidCalls = () => {
@@ -107,6 +116,7 @@ beforeEach(() => {
   state.upstream.mockImplementation(async () => Response.json({ content: [{ text: 'A useful insight.', offset: 0, duration: 10 }] }));
   vi.stubGlobal('fetch', state.upstream);
   vi.stubEnv('SUPADATA_API_KEY', 'local-mock-key');
+  vi.stubEnv('SUPADATA_SPEND_POLICY', 'native-v1');
 });
 
 describe('cache and public-page classification', () => {
@@ -135,6 +145,80 @@ describe('cache and public-page classification', () => {
 });
 
 describe('paid admission', () => {
+  it.each(['minimax', 'grok', 'gemini'])('chat uses one mocked network dispatch through the real %s adapter/registry for optional enrichment', async provider => {
+    const actual = await vi.importActual<typeof import('@/lib/ai-client')>('@/lib/ai-client');
+    vi.stubEnv('AI_PROVIDER', provider);
+    vi.stubEnv('MINIMAX_API_KEY', 'local-mock-key');
+    vi.stubEnv('XAI_API_KEY', 'local-mock-key');
+    vi.stubEnv('GEMINI_API_KEY', 'local-mock-key');
+    try {
+      for (const followUpQuestions of [undefined, { error: '503 timeout' }, ['One?', 42], ['A?', 'B?']]) {
+        const content = JSON.stringify({ answer: 'A useful insight [00:00].', timestamps: ['00:00'], followUpQuestions });
+        const network = vi.fn(async () => Response.json(provider === 'gemini'
+          ? { candidates: [{ content: { role: 'model', parts: [{ text: content }] }, finishReason: 'STOP', index: 0 }] }
+          : { choices: [{ message: { content } }] }));
+        vi.stubGlobal('fetch', network);
+        state.text.mockImplementation(actual.generateAIResponse);
+        const response = await chat(request('chat', { ...payload, message: 'Explain this insight' } as any));
+        const data = await response.json();
+        expect(data.content).toBe('A useful insight [00:00].');
+        expect(data.citations).toHaveLength(1);
+        expect(data.followUpQuestions).toEqual(Array.isArray(followUpQuestions) && followUpQuestions[0] === 'A?' ? ['A?', 'B?'] : undefined);
+        expect(network).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('recovers an answer from a truncated question tail without another generation', async () => {
+    state.text.mockResolvedValue('{"answer":"A useful insight [00:00].","timestamps":["00:00"],"followUpQuestions":["Unfinished');
+    const response = await chat(request('chat', { ...payload, message: 'Explain this insight' } as any));
+    expect(await response.json()).toMatchObject({ content: 'A useful insight [00:00].', citations: [{ number: 1 }] });
+    expect(state.text).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects chat-shaped forged standalone questions without an initial flow', async () => {
+    const response = await questions(new NextRequest('http://localhost/api/suggested-questions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, lastQuestion: 'Explain this?', count: 2,
+        chatHistory: [{ role: 'assistant', content: 'A completed chat answer' }],
+        followUpQuestions: ['Next?', 'Why?'] }),
+    }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: 'ANALYSIS_INTENT_REQUIRED' });
+    noPaidCalls();
+  });
+
+  it.each([
+    undefined, null, 'not an array', ['Only one?'], ['Valid?', 42], ['', 'Why?'],
+    ['Same?', ' same? '], ['x'.repeat(301), 'Why?'], ['A?', 'B?', 'C?'],
+    { questions: ['A?', 'B?'] },
+  ].map(followUpQuestions => ({ followUpQuestions })))('chat preserves answer/citations and makes one call for invalid optional questions $followUpQuestions', async ({ followUpQuestions }) => {
+    state.text.mockResolvedValue(JSON.stringify({ answer: 'A useful insight [00:00].', timestamps: ['00:00'], followUpQuestions }));
+    const response = await chat(request('chat', { ...payload, message: 'Explain this insight' } as any));
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.content).toBe('A useful insight [00:00].');
+    expect(data.citations).toHaveLength(1);
+    expect(data.followUpQuestions).toBeUndefined();
+    expect(state.text).toHaveBeenCalledTimes(1);
+    expect(state.upstream).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('chat returns generated questions with existing citations (fenced=%s)', async fenced => {
+    const json = JSON.stringify({ answer: 'A useful insight [00:00].', timestamps: ['00:00'],
+      followUpQuestions: [' How can I apply this? ', 'What are the limitations?'] });
+    state.text.mockResolvedValue(fenced ? `\`\`\`json\n${json}\n\`\`\`` : json);
+    const response = await chat(request('chat', { ...payload, message: 'Explain this insight' } as any));
+    expect(await response.json()).toMatchObject({ content: 'A useful insight [00:00].',
+      citations: [{ number: 1, text: 'A useful insight.', start: 0, end: 10 }],
+      followUpQuestions: ['How can I apply this?', 'What are the limitations?'] });
+    expect(state.text).toHaveBeenCalledTimes(1);
+    expect(state.text.mock.calls[0][1].maxOutputTokens).toBe(1280);
+    expect(state.text.mock.calls[0][1].provider).toBeUndefined();
+  });
+
   const routes = { transcript, analysis, summary, topics, preview, questions, quotes, chat, image, enhance, translate };
   for (const [name, route] of Object.entries(routes)) {
     const failures = name === 'enhance' ? ['cacheError', 'limiterError', 'usageError'] as const : ['cacheError', 'limiterError', 'guestError'] as const;
@@ -178,6 +262,29 @@ describe('paid admission', () => {
     state.limiterError = failure;
     expect((await cache(request('check-video-cache'))).status).toBe(200);
     noPaidCalls();
+  });
+  it.each(['', 'invalid-policy'])('missing/invalid paid policy %s blocks dispatch but leaves cached public reading', async policy => {
+    vi.stubEnv('SUPADATA_SPEND_POLICY', policy);
+    expect((await transcript(request('transcript'))).status).toBe(503);
+    state.cache = { id: 'cached-id', transcript: payload.transcript, topics: [], title: 'Test' };
+    expect((await cache(request('check-video-cache'))).status).toBe(200);
+    noPaidCalls();
+  });
+  it('canonicalizes general admission across transcript query variations', async () => {
+    await transcript(request('transcript?nonce=1'));
+    await transcript(request('transcript?nonce=2'));
+    const keys = state.rpc.mock.calls.filter(([name]) => name === 'check_rate_limit_server').map(([, args]) => args.p_key);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[0]).toContain('ratelimit:/api/transcript:');
+  });
+  it('transcript-only does not charge; later highlights retain the existing single charging point', async () => {
+    state.user = { id: 'user-1' };
+    expect((await transcript(request('transcript'))).status).toBe(200);
+    expect(state.rpc.mock.calls.filter(([name]) => name === 'consume_video_credit_atomically')).toHaveLength(0);
+    expect((await analysis(request('video-analysis'))).status).toBe(200);
+    expect(state.rpc.mock.calls.filter(([name]) => name === 'consume_video_credit_atomically')).toHaveLength(1);
+    expect(state.topics).toHaveBeenCalledTimes(1);
   });
   it.each(['saveError', 'creditError'] as const)('stops further paid work after post-provider %s', async field => {
     state.user = { id: 'user-1' };
