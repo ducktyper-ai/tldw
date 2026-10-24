@@ -1,4 +1,5 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import { dependencyUnavailable } from '@/lib/dependency-unavailable';
 
 interface VideoAnalysisParams {
   youtubeId: string;
@@ -60,9 +61,8 @@ export async function saveVideoAnalysisWithRetry(
         p_available_languages: params.availableLanguages ?? null
       });
 
-      if (error) {
-        throw error;
-      }
+      if (error) throw error;
+      if (typeof data !== 'string' || !data) throw new Error('Missing saved analysis ID');
 
       return {
         success: true,
@@ -83,17 +83,14 @@ export async function saveVideoAnalysisWithRetry(
       if (isRetryableError && attempt < maxRetries - 1) {
         console.warn(
           `[saveVideoAnalysis] Attempt ${attempt + 1}/${maxRetries} failed with retryable error, ` +
-          `retrying in ${retryDelayMs * (attempt + 1)}ms:`,
-          errorMessage
+          `retrying in ${retryDelayMs * (attempt + 1)}ms`
         );
         await new Promise(r => setTimeout(r, retryDelayMs * (attempt + 1)));
         continue;
       }
 
-      console.error(
-        `[saveVideoAnalysis] Attempt ${attempt + 1}/${maxRetries} failed (final):`,
-        err
-      );
+      dependencyUnavailable('analysis-save', err);
+      return { success: false, videoId: null, error: 'PERSISTENCE_UNAVAILABLE', retriedCount: attempt };
     }
   }
 

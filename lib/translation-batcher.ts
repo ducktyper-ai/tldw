@@ -9,6 +9,7 @@
  */
 
 import type { TranslationContext } from './translation/types';
+import { DependencyUnavailableError } from './dependency-unavailable';
 
 interface TranslationRequest {
   text: string;
@@ -24,6 +25,7 @@ export class TranslationBatcher {
   private queue: TranslationRequest[] = [];
   private processing = false;
   private scheduledTimeout: NodeJS.Timeout | null = null;
+  private blockedError: DependencyUnavailableError | null = null;
 
   // Configuration
   private readonly batchDelay: number;
@@ -39,7 +41,8 @@ export class TranslationBatcher {
     cache: Map<string, string>,
     maxRetries: number = 3,
     batchThrottleMs: number = 200,
-    onError?: (error: Error, isRateLimitError: boolean) => void
+    onError?: (error: Error, isRateLimitError: boolean) => void,
+    private readonly paidFetch: typeof fetch = fetch
   ) {
     if (maxBatchSize < 1 || maxBatchSize > 10000) {
       throw new Error('maxBatchSize must be between 1 and 10000');
@@ -67,6 +70,7 @@ export class TranslationBatcher {
       const cached = this.cache.get(cacheKey)!;
       return cached;
     }
+    if (this.blockedError) throw this.blockedError;
 
     // Add to queue and return a promise
     return new Promise<string>((resolve, reject) => {
@@ -156,6 +160,10 @@ export class TranslationBatcher {
     // Process each language group with throttling between groups
     let isFirst = true;
     for (const [targetLanguage, requests] of byLanguage.entries()) {
+      if (this.blockedError) {
+        requests.forEach(request => request.reject(this.blockedError!));
+        continue;
+      }
       // Add throttle delay between batches (except for the first one)
       if (!isFirst && this.batchThrottleMs > 0) {
         await this.sleep(this.batchThrottleMs);
@@ -221,7 +229,7 @@ export class TranslationBatcher {
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
         // Make API call
-        const response = await fetch('/api/translate', {
+        const response = await this.paidFetch('/api/translate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -230,6 +238,7 @@ export class TranslationBatcher {
             ...(context && { context })
           })
         });
+        if (response.status === 503) throw new DependencyUnavailableError('translation');
 
         if (!response.ok) {
           // Handle rate limiting with retry
@@ -278,6 +287,12 @@ export class TranslationBatcher {
         // Success! Exit retry loop
         return;
       } catch (error) {
+        if (error instanceof DependencyUnavailableError) {
+          this.blockedError = error;
+          [...requests, ...this.queue.splice(0)].forEach(request => request.reject(error));
+          this.onError?.(error, false);
+          return;
+        }
         lastError = error as Error;
 
         // If this is the last attempt, don't retry

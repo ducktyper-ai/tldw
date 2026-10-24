@@ -21,6 +21,7 @@ import { ensureMergedFormat } from '@/lib/transcript-format-detector';
 import { TranscriptSegment } from '@/lib/types';
 import { getGuestAccessState, recordGuestUsage, setGuestCookies } from '@/lib/guest-usage';
 import { saveVideoAnalysisWithRetry } from '@/lib/video-save-utils';
+import { DependencyUnavailableError, dependencyUnavailable, unavailableResponse } from '@/lib/dependency-unavailable';
 
 type SupabaseServerClient = Awaited<ReturnType<typeof createClient>>;
 
@@ -71,8 +72,7 @@ async function hasCountedGenerationThisPeriod({
     .maybeSingle();
 
   if (error) {
-    console.error('Failed to check existing generation for cached video:', error);
-    return false;
+    throw dependencyUnavailable('generation-history', error);
   }
 
   return Boolean(data);
@@ -113,16 +113,18 @@ async function handler(req: NextRequest) {
       data: { user }
     } = await supabase.auth.getUser();
 
-    const guestState = user ? null : await getGuestAccessState({ supabase });
+    const guestState = user ? null : await getGuestAccessState();
     const unlimitedAccess = hasUnlimitedVideoAllowance(user);
 
     let cachedVideo: any = null;
     if (!forceRegenerate) {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('video_analyses')
         .select('*')
         .eq('youtube_id', videoId)
-        .single();
+        .maybeSingle();
+
+      if (error) throw dependencyUnavailable('video-cache', error);
 
       cachedVideo = data ?? null;
     }
@@ -185,7 +187,7 @@ async function handler(req: NextRequest) {
           // Consume the one-time guest allowance only when this isn't a cached analysis
           const shouldConsumeGuest = !guestState.used && !isCachedAnalysis;
           if (shouldConsumeGuest) {
-            await recordGuestUsage(guestState, { supabase });
+            await recordGuestUsage(guestState);
           }
           setGuestCookies(response, guestState, {
             markUsed: shouldConsumeGuest
@@ -194,6 +196,7 @@ async function handler(req: NextRequest) {
 
         return response;
       } catch (error) {
+        if (error instanceof DependencyUnavailableError) throw error;
         console.error('Error generating theme-specific topics:', error);
         return respondWithNoCredits(
           { error: 'Failed to generate themed topics. Please try again.' },
@@ -314,10 +317,7 @@ async function handler(req: NextRequest) {
         });
 
         if (!saveResult.success) {
-          console.error(
-            `[video-analysis] Failed to link cached video ${videoId} to user ${user.id}:`,
-            saveResult.error
-          );
+          throw dependencyUnavailable('analysis-save');
         } else if (saveResult.retriedCount > 0) {
           console.log(
             `[video-analysis] Successfully saved cached video after ${saveResult.retriedCount} retries`
@@ -344,23 +344,13 @@ async function handler(req: NextRequest) {
         });
 
         if (!consumeResult.success) {
-          console.error('Failed to consume cached video credit:', consumeResult.error);
+          throw dependencyUnavailable('credit-record');
         } else if (consumeResult.deduplicated) {
           console.log(`[video-analysis] Deduplicated credit for cached video ${videoId} (user: ${user.id})`);
         }
       }
 
-      let themes: string[] = [];
-      try {
-        themes = await generateThemesFromTranscript(
-          transcript,
-          videoInfo,
-          undefined,
-          videoInfo?.language
-        );
-      } catch (error) {
-        console.error('Error generating themes for cached video:', error);
-      }
+      const themes: string[] = [];
 
       // Ensure transcript is in merged format (backward compatibility for old cached videos)
       const originalTranscript = cachedVideo.transcript as TranscriptSegment[];
@@ -410,18 +400,6 @@ async function handler(req: NextRequest) {
     const topicCandidates = generationResult.candidates;
     const modelUsed = generationResult.modelUsed;
 
-    let themes: string[] = [];
-    try {
-      themes = await generateThemesFromTranscript(
-        transcript,
-        videoInfo,
-        undefined,
-        videoInfo?.language
-      );
-    } catch (error) {
-      console.error('Error generating themes:', error);
-    }
-
     // Save analysis to database FIRST (before consuming credit)
     // This ensures credits are only consumed if save succeeds
     const saveResult = await saveVideoAnalysisWithRetry(supabase, {
@@ -441,11 +419,7 @@ async function handler(req: NextRequest) {
     });
 
     if (!saveResult.success) {
-      // Log but don't fail the request - user should still see their results
-      console.error(
-        `[video-analysis] Failed to save new video ${videoId}:`,
-        saveResult.error
-      );
+      throw dependencyUnavailable('analysis-save');
     } else if (saveResult.retriedCount > 0) {
       console.log(
         `[video-analysis] Successfully saved new video after ${saveResult.retriedCount} retries`
@@ -470,14 +444,23 @@ async function handler(req: NextRequest) {
       });
 
       if (!consumeResult.success) {
-        console.error('Failed to consume video credit:', consumeResult.error);
+        throw dependencyUnavailable('credit-record');
       } else if (consumeResult.deduplicated) {
         console.log(`[video-analysis] Deduplicated credit for new video ${videoId} (user: ${user.id})`);
       }
     }
 
     if (!user && guestState) {
-      await recordGuestUsage(guestState, { supabase });
+      await recordGuestUsage(guestState);
+    }
+
+    // No additional paid work until required persistence has succeeded.
+    let themes: string[] = [];
+    try {
+      themes = await generateThemesFromTranscript(transcript, videoInfo, undefined, videoInfo?.language);
+    } catch (error) {
+      if (error instanceof DependencyUnavailableError) throw error;
+      console.error('Error generating themes');
     }
 
     const response = NextResponse.json({
@@ -499,6 +482,10 @@ async function handler(req: NextRequest) {
 
     return response;
   } catch (error) {
+    if (error instanceof DependencyUnavailableError) {
+      const response = unavailableResponse();
+      return new NextResponse(response.body, { status: 503, headers: response.headers });
+    }
     // Log error details server-side only
     console.error('Error in video analysis:', error);
 
@@ -510,4 +497,4 @@ async function handler(req: NextRequest) {
   }
 }
 
-export const POST = withSecurity(handler, SECURITY_PRESETS.PUBLIC);
+export const POST = withSecurity(handler, SECURITY_PRESETS.PAID);

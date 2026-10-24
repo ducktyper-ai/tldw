@@ -92,6 +92,7 @@ async function handler(request: NextRequest) {
 }
 
 export const POST = withSecurity(handler, {
+  paidWork: true,
   rateLimit: RATE_LIMITS.AUTH_GENERATION,
   maxBodySize: 10 * 1024 * 1024,
   allowedMethods: ['POST']

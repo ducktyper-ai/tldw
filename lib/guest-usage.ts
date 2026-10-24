@@ -1,13 +1,11 @@
 import { cookies, headers } from 'next/headers'
 import { NextResponse } from 'next/server'
 import crypto from 'crypto'
-import { createClient } from '@/lib/supabase/server'
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { guestUsage } from '@/lib/limiter-store'
 
 const GUEST_TOKEN_COOKIE = 'tldw_guest_token'
 const GUEST_USED_COOKIE = 'tldw_guest_analysis_used'
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 5 // 5 years
-const GUEST_RATE_KEY = 'guest-analysis'
 
 export type GuestAccessState = {
   token: string
@@ -27,10 +25,7 @@ async function getIpHash(): Promise<string | null> {
   return crypto.createHash('sha256').update(rawIp).digest('hex').slice(0, 32)
 }
 
-export async function getGuestAccessState(options?: {
-  supabase?: SupabaseClient
-}): Promise<GuestAccessState> {
-  const supabase = options?.supabase ?? (await createClient())
+export async function getGuestAccessState(): Promise<GuestAccessState> {
   const cookieStore = await cookies()
 
   const existingToken = cookieStore.get(GUEST_TOKEN_COOKIE)?.value
@@ -47,18 +42,7 @@ export async function getGuestAccessState(options?: {
   let used = usedCookie
 
   if (!used) {
-    const { data, error } = await supabase
-      .from('rate_limits')
-      .select('id')
-      .eq('key', GUEST_RATE_KEY)
-      .in('identifier', identifiers)
-      .limit(1)
-
-    if (error) {
-      console.error('Failed to read guest usage:', error)
-    }
-
-    used = Boolean(data?.length)
+    used = await guestUsage(identifiers)
   }
 
   return {
@@ -92,20 +76,7 @@ export function setGuestCookies(
 }
 
 export async function recordGuestUsage(
-  state: GuestAccessState,
-  options?: { supabase?: SupabaseClient }
+  state: GuestAccessState
 ): Promise<void> {
-  const supabase = options?.supabase ?? (await createClient())
-
-  const rows = state.identifiers.map((identifier) => ({
-    key: GUEST_RATE_KEY,
-    identifier,
-    timestamp: new Date().toISOString()
-  }))
-
-  const { error } = await supabase.from('rate_limits').insert(rows)
-
-  if (error) {
-    console.error('Failed to record guest usage:', error)
-  }
+  await guestUsage(state.identifiers, true)
 }

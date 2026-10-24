@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { DependencyUnavailableError, dependencyUnavailable } from '@/lib/dependency-unavailable';
 import { z } from 'zod';
 import { transcriptSchema } from '@/lib/validation';
 import { createClient } from '@/lib/supabase/server';
@@ -269,7 +270,7 @@ async function handler(req: NextRequest) {
       });
 
       if (!consumeResult.success) {
-        console.warn('Failed to record image generation:', consumeResult.error);
+        throw dependencyUnavailable('image-credit-record');
       }
     }
 
@@ -290,6 +291,7 @@ async function handler(req: NextRequest) {
         : IMAGE_TIER_LIMITS.free,
     });
   } catch (error) {
+    if (error instanceof DependencyUnavailableError) throw error;
     console.error('Error generating image:', error);
     return NextResponse.json(
       {
@@ -303,5 +305,6 @@ async function handler(req: NextRequest) {
 
 export const POST = withSecurity(handler, {
   ...SECURITY_PRESETS.PUBLIC,
+  paidWork: true,
   maxBodySize: 3 * 1024 * 1024, // transcripts can be large
 });

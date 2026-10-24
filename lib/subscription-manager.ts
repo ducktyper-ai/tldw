@@ -9,6 +9,7 @@ import {
   type UsageBreakdown,
 } from '@/lib/usage-tracker';
 import type { ProfilesUpdate, SubscriptionStatus, SubscriptionTier } from '@/lib/supabase/types';
+import { dependencyUnavailable } from '@/lib/dependency-unavailable';
 
 export type { SubscriptionStatus, SubscriptionTier };
 
@@ -112,20 +113,7 @@ export async function getUserSubscriptionStatus(
     .maybeSingle();
 
   if (error) {
-    console.error('Error fetching subscription from profiles:', error);
-    // Return default free-tier subscription instead of null
-    return {
-      userId,
-      tier: 'free',
-      status: null,
-      stripeCustomerId: null,
-      stripeSubscriptionId: null,
-      currentPeriodStart: null,
-      currentPeriodEnd: null,
-      cancelAtPeriodEnd: false,
-      topupCredits: 0,
-      userCreatedAt: null,
-    };
+    throw dependencyUnavailable('subscription', error);
   }
 
   if (!profile) {
@@ -195,13 +183,7 @@ export async function getUsageStats(
   try {
     usage = await calculateUsageInPeriod(userId, start, end, { client: supabase });
   } catch (error) {
-    console.error('Failed to calculate usage in period:', error);
-    usage = {
-      counted: 0,
-      cached: 0,
-      total: 0,
-      byTier: {},
-    };
+    throw dependencyUnavailable('usage', error);
   }
 
   const baseLimit = TIER_LIMITS[subscription.tier];
@@ -432,7 +414,7 @@ export async function consumeVideoCreditAtomic({
   });
 
   if (error) {
-    console.error('Atomic credit consumption failed:', error);
+    dependencyUnavailable('credit-record', error);
     return { success: false, error: 'ATOMIC_CONSUMPTION_FAILED' };
   }
 
@@ -623,8 +605,7 @@ async function isVideoCached(youtubeId: string, client: DatabaseClient): Promise
     .maybeSingle();
 
   if (error) {
-    console.error('Failed to check video cache status:', error);
-    return false;
+    throw dependencyUnavailable('video-cache', error);
   }
 
   return Boolean(data);

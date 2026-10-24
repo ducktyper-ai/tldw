@@ -46,6 +46,9 @@ import { csrfFetch } from "@/lib/csrf-client";
 import { toast } from "sonner";
 import { hasSpeakerMetadata } from "@/lib/transcript-export";
 import { buildSuggestedQuestionFallbacks } from "@/lib/suggested-question-fallback";
+import { DependencyUnavailableError, SERVICE_UNAVAILABLE_MESSAGE } from '@/lib/dependency-unavailable';
+import { ServiceUnavailable } from '@/components/service-unavailable';
+import { fetchAnalysisDependency } from '@/lib/analysis-dependency-client';
 
 const GUEST_LIMIT_MESSAGE = "You've used your free preview. Create a free account for 3 videos/month.";
 const AUTH_LIMIT_MESSAGE = "You've used all 3 free videos this month. Upgrade to Pro for 100 videos/month.";
@@ -230,6 +233,31 @@ export default function AnalyzePage() {
   const rightColumnTabsRef = useRef<RightColumnTabsHandle>(null);
   const youtubePlayerRef = useRef<YouTubePlayerHandle | null>(null);
   const abortManager = useRef(new AbortManager());
+  const paidWorkBlocked = useRef(false);
+  const stopPaidWork = useCallback(() => {
+    paidWorkBlocked.current = true;
+    abortManager.current.cleanup();
+    setError(SERVICE_UNAVAILABLE_MESSAGE);
+  }, []);
+  const paidFetch = useCallback(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (paidWorkBlocked.current) throw new DependencyUnavailableError('paid-work');
+    const response = await fetch(input, init);
+    if (response.status === 503) {
+      stopPaidWork();
+      throw new DependencyUnavailableError('paid-work');
+    }
+    return response;
+  }, [stopPaidWork]);
+  const persistAnalysisUpdate = useCallback(async (body: Record<string, unknown>) => {
+    try {
+      const response = await csrfFetch.post('/api/update-video-analysis', body);
+      if (response.status >= 500) throw new DependencyUnavailableError('analysis-update');
+      return response;
+    } catch {
+      stopPaidWork();
+      throw new DependencyUnavailableError('analysis-update');
+    }
+  }, [stopPaidWork]);
   const cachedHighlightPayloadRef = useRef<CachedHighlightPayload | null>(null);
   const selectedThemeRef = useRef<string | null>(null);
   const seoPathRef = useRef<string | null>(null);
@@ -266,7 +294,7 @@ export default function AnalyzePage() {
     handleRequestTranslation,
     handleBulkTranslation,
     handleLanguageChange,
-  } = useTranslation();
+  } = useTranslation(paidFetch);
 
   // Create unified translation handler with videoInfo context
   const translateWithContext: TranslationRequestHandler = useCallback(
@@ -609,6 +637,8 @@ export default function AnalyzePage() {
 
       // Cleanup any pending requests from previous analysis
       abortManager.current.cleanup();
+      paidWorkBlocked.current = false;
+      handleLanguageChange(null);
       pendingThemeRequestsRef.current.clear();
       activeThemeRequestIdRef.current = null;
       nextThemeRequestIdRef.current = 0;
@@ -647,7 +677,8 @@ export default function AnalyzePage() {
       setShowChatTab(false);
 
       // Reset cached suggested questions
-      setCachedSuggestedQuestions(null);
+      // Static suggestions avoid paid background work merely to open cached content.
+      setCachedSuggestedQuestions(buildSuggestedQuestionFallbacks(3));
 
       // Store video ID immediately for potential post-auth linking
       storeCurrentVideoForAuth(extractedVideoId);
@@ -662,14 +693,20 @@ export default function AnalyzePage() {
       const shouldSkipCacheForLanguage = preferredLanguage && preferredLanguage !== 'en';
       
       if (!forceRegenerate && !shouldSkipCacheForLanguage) {
-        const cacheResponse = await fetch("/api/check-video-cache", {
+        const cacheResponse = await fetchAnalysisDependency("/api/check-video-cache", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url })
         });
 
+        if (!cacheResponse.ok) throw new Error(SERVICE_UNAVAILABLE_MESSAGE);
+
         if (cacheResponse.ok) {
-          const cacheData = await cacheResponse.json();
+          const cacheData = await cacheResponse.json().catch(() => { throw new Error(SERVICE_UNAVAILABLE_MESSAGE); });
+          if (!cacheData || !['found', 'absent'].includes(cacheData.status) ||
+              cacheData.cached !== (cacheData.status === 'found')) {
+            throw new Error(SERVICE_UNAVAILABLE_MESSAGE);
+          }
 
           if (cacheData.cached) {
             // Capture database UUID for notes saving
@@ -728,53 +765,24 @@ export default function AnalyzePage() {
               // Store video ID for potential post-auth linking (for cached videos)
               storeCurrentVideoForAuth(extractedVideoId);
 
-              // Set page state back to idle
-              setPageState('IDLE');
-              setLoadingStage(null);
-              setSwitchingToLanguage(null);
               setIsShareReady(true);
-
-              // Fetch available transcript languages for cached videos
-              // This enables the language selector dropdown to show all available native languages
-              // NOTE: Only update availableLanguages, preserve the cached language value
-              backgroundOperation(
-                'fetch-available-languages',
-                async () => {
-                  const langResponse = await fetch("/api/transcript", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ url, lang: 'en' }),
-                  });
-
-                  if (langResponse.ok) {
-                    const langData = await langResponse.json();
-                    const availableLanguages = langData.availableLanguages;
-                    
-                    if (availableLanguages) {
-                      setVideoInfo(prev => prev ? {
-                        ...prev,
-                        // Preserve the cached language - only update availableLanguages
-                        // If no cached language exists, use the API response as fallback
-                        language: prev.language ?? langData.language,
-                        availableLanguages: availableLanguages ?? prev.availableLanguages
-                      } : null);
-                    }
-                  }
-                },
-                (error) => {
-                  console.error("Failed to fetch available languages:", error);
-                }
-              );
 
               // Auto-start takeaways generation if not available
               if (!cacheData.summary) {
+                const eligibility = await fetchAnalysisDependency('/api/check-limit');
+                if (!eligibility.ok) throw new Error(SERVICE_UNAVAILABLE_MESSAGE);
+                const decision = await eligibility.json();
+                if (!decision.canGenerate) {
+                  setTakeawaysError('Summary is not available. Sign in or check your analysis allowance to generate it.');
+                  return;
+                }
                 setShowChatTab(true);
                 setIsGeneratingTakeaways(true);
 
                 backgroundOperation(
                   'generate-cached-takeaways',
                   async () => {
-                    const summaryRes = await fetch("/api/generate-summary", {
+                    const summaryRes = await paidFetch("/api/generate-summary", {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({
@@ -799,10 +807,11 @@ export default function AnalyzePage() {
                     await backgroundOperation(
                       'update-cached-takeaways',
                       async () => {
-                        const res = await csrfFetch.post("/api/update-video-analysis", {
+                        const res = await persistAnalysisUpdate({
                           videoId: extractedVideoId,
                           summary: generatedTakeaways
                         });
+                        if (res.status === 503) stopPaidWork();
                         // 401/403 is expected for anonymous users or non-owners
                         if (!res.ok && res.status !== 401 && res.status !== 403) {
                           throw new Error('Failed to update takeaways');
@@ -827,6 +836,13 @@ export default function AnalyzePage() {
         }
       }
 
+      const eligibility = await fetchAnalysisDependency('/api/check-limit');
+      if (!eligibility.ok) throw new Error(SERVICE_UNAVAILABLE_MESSAGE);
+      const decision = await eligibility.json();
+      if (!decision.canGenerate) {
+        throw new Error(decision.requiresAuth ? GUEST_LIMIT_MESSAGE : AUTH_LIMIT_MESSAGE);
+      }
+
       setPageState('ANALYZING_NEW');
       setLoadingStage('fetching');
 
@@ -836,12 +852,13 @@ export default function AnalyzePage() {
       const videoInfoController = abortManager.current.createController('videoInfo', 100000);
 
       // Fetch transcript and video info in parallel
-      const transcriptPromise = fetch("/api/transcript", {
+      const transcriptPromise = paidFetch("/api/transcript", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, lang: preferredLanguage }),
         signal: transcriptController.signal,
       }).catch(err => {
+        if (paidWorkBlocked.current) throw new Error(SERVICE_UNAVAILABLE_MESSAGE);
         if (err.name === 'AbortError') {
           throw new Error("Transcript request timed out. Please try again.");
         }
@@ -960,9 +977,11 @@ export default function AnalyzePage() {
       setLoadingStage('understanding');
 
       // Generate quick preview (non-blocking)
-      fetch("/api/quick-preview", {
+      const previewController = abortManager.current.createController('preview', 30000);
+      paidFetch("/api/quick-preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: previewController.signal,
         body: JSON.stringify({
           transcript: normalizedTranscriptData,
           videoTitle: fetchedVideoInfo?.title,
@@ -987,7 +1006,7 @@ export default function AnalyzePage() {
         })
         .catch((error) => {
           console.error('Error generating quick preview:', error);
-        });
+        }).finally(() => abortManager.current.cleanup('preview'));
 
       // Generate takeaways in the background. Highlight reels are intentionally
       // deferred until the user clicks the generate button.
@@ -999,7 +1018,7 @@ export default function AnalyzePage() {
       backgroundOperation(
         'generate-takeaways',
         async () => {
-          const summaryRes = await fetch("/api/generate-summary", {
+          const summaryRes = await paidFetch("/api/generate-summary", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1024,10 +1043,11 @@ export default function AnalyzePage() {
           await backgroundOperation(
             'update-takeaways',
             async () => {
-              const updateRes = await csrfFetch.post("/api/update-video-analysis", {
+              const updateRes = await persistAnalysisUpdate({
                 videoId: extractedVideoId,
                 summary: generatedTakeaways
               });
+              if (updateRes.status === 503) stopPaidWork();
 
               if (!updateRes.ok && updateRes.status !== 404 && updateRes.status !== 401 && updateRes.status !== 403) {
                 throw new Error('Failed to update takeaways');
@@ -1068,7 +1088,11 @@ export default function AnalyzePage() {
   }, [
     storeCurrentVideoForAuth,
     videoId,
-    forceRegenerate
+    forceRegenerate,
+    paidFetch,
+    stopPaidWork,
+    persistAnalysisUpdate,
+    handleLanguageChange
   ]);
 
   useEffect(() => {
@@ -1214,7 +1238,7 @@ export default function AnalyzePage() {
     backgroundOperation(
       'generate-questions',
       async () => {
-        const res = await fetch("/api/suggested-questions", {
+        const res = await paidFetch("/api/suggested-questions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1266,10 +1290,11 @@ export default function AnalyzePage() {
         await backgroundOperation(
           'update-questions',
           async () => {
-            const updateRes = await csrfFetch.post("/api/update-video-analysis", {
+            const updateRes = await persistAnalysisUpdate({
               videoId,
               suggestedQuestions: normalizedQuestions
             });
+            if (updateRes.status === 503) stopPaidWork();
 
             if (!updateRes.ok && updateRes.status !== 404 && updateRes.status !== 401 && updateRes.status !== 403) {
               throw new Error('Failed to update suggested questions');
@@ -1283,7 +1308,7 @@ export default function AnalyzePage() {
         console.error("Failed to generate suggested questions:", error);
       }
     );
-  }, [videoId]);
+  }, [videoId, paidFetch, stopPaidWork, persistAnalysisUpdate]);
 
   const confirmShareReady = useCallback((url: string) => {
     backgroundOperation(
@@ -1345,7 +1370,7 @@ export default function AnalyzePage() {
     setIsRateLimitError(false);
 
     try {
-      const response = await fetch("/api/video-analysis", {
+      const response = await paidFetch("/api/video-analysis", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1418,7 +1443,8 @@ export default function AnalyzePage() {
     applyHighlightResponse,
     confirmShareReady,
     normalizedUrl,
-    generateSuggestedQuestionsForTopics
+    generateSuggestedQuestionsForTopics,
+    paidFetch
   ]);
 
   useEffect(() => {
@@ -1501,7 +1527,7 @@ export default function AnalyzePage() {
       const exclusionKeys = Array.from(baseTopicKeySet).map((key) => key.slice(0, 500));
 
       try {
-        const response = await fetch("/api/video-analysis", {
+        const response = await paidFetch("/api/video-analysis", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1614,7 +1640,8 @@ export default function AnalyzePage() {
     usedTopicKeys,
     mode,
     setIsPlayingAll,
-    setPlayAllIndex
+    setPlayAllIndex,
+    paidFetch
   ]);
 
   // Dynamically adjust right column height to match video container
@@ -1863,7 +1890,11 @@ export default function AnalyzePage() {
         </section>
       )}
 
-      {pageState === 'IDLE' && videoId && topics.length === 0 && error && (
+      {pageState === 'IDLE' && error === SERVICE_UNAVAILABLE_MESSAGE && (
+        <ServiceUnavailable onRetry={() => processVideo(normalizedUrl, mode)} />
+      )}
+
+      {pageState === 'IDLE' && videoId && topics.length === 0 && error && error !== SERVICE_UNAVAILABLE_MESSAGE && (
         <section className="flex min-h-[calc(100vh-11rem)] flex-col items-center justify-center px-5 text-center">
           <Card className="w-full max-w-2xl border border-slate-200 bg-white/90 p-9 backdrop-blur-sm">
             <div className="space-y-4">
@@ -1985,6 +2016,8 @@ export default function AnalyzePage() {
                 style={{ height: transcriptHeight, maxHeight: transcriptHeight, minHeight: 420 }}
               >
                 <RightColumnTabs
+                  paidFetch={paidFetch}
+                  paidWorkUnavailable={error === SERVICE_UNAVAILABLE_MESSAGE}
                   ref={rightColumnTabsRef}
                   transcript={transcript}
                   selectedTopic={selectedTopic}

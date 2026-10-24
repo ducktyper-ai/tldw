@@ -342,6 +342,7 @@ async function handler(request: NextRequest) {
 
 // Apply security with generation rate limits
 export const POST = withSecurity(handler, {
+  paidWork: true,
   rateLimit: RATE_LIMITS.AUTH_GENERATION, // Use authenticated rate limit
   maxBodySize: 10 * 1024 * 1024, // 10MB for large transcripts
   allowedMethods: ['POST']

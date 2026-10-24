@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { withSecurity, SECURITY_PRESETS } from '@/lib/security-middleware';
+import { DependencyUnavailableError, dependencyUnavailable } from '@/lib/dependency-unavailable';
 
 interface UpdateResult {
   success: boolean;
@@ -48,11 +49,7 @@ async function handler(req: NextRequest) {
       .single<UpdateResult>();
 
     if (updateError) {
-      console.error('Error updating video analysis:', updateError);
-      return NextResponse.json(
-        { error: 'Failed to update video analysis' },
-        { status: 500 }
-      );
+      throw dependencyUnavailable('analysis-update', updateError);
     }
 
     // Check if update was authorized
@@ -69,11 +66,8 @@ async function handler(req: NextRequest) {
     });
 
   } catch (error) {
-    console.error('Error in update video analysis:', error);
-    return NextResponse.json(
-      { error: 'Failed to process update request' },
-      { status: 500 }
-    );
+    if (error instanceof DependencyUnavailableError) throw error;
+    throw dependencyUnavailable('analysis-update', error);
   }
 }
 

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { DependencyUnavailableError } from '@/lib/dependency-unavailable';
 import { withSecurity } from '@/lib/security-middleware';
 import { RATE_LIMITS, RateLimiter, rateLimitResponse } from '@/lib/rate-limiter';
 import { getTranslationClient } from '@/lib/translation';
@@ -130,6 +131,7 @@ async function handler(request: NextRequest) {
       { headers: rateLimitHeaders ?? {} }
     );
   } catch (error) {
+    if (error instanceof DependencyUnavailableError) throw error;
     // Log full error details server-side for debugging
     console.error('[TRANSLATE] Translation error:', {
       message: error instanceof Error ? error.message : String(error),
@@ -161,6 +163,7 @@ async function handler(request: NextRequest) {
 // Apply security middleware
 // Note: Rate limiting is handled inside the handler to support different limits for anon/auth users
 export const POST = withSecurity(handler, {
+  paidWork: true,
   maxBodySize: 3 * 1024 * 1024, // 3MB to allow larger batches
   allowedMethods: ['POST']
 });
