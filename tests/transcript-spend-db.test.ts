@@ -1,3 +1,4 @@
+import { readTestPostgres } from '../scripts/test-postgres.mjs';
 import { execFile } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
@@ -9,11 +10,11 @@ vi.mock('@/lib/transcript-cache', () => ({ assertTranscriptCacheOwner: async () 
 const state = vi.hoisted(() => ({ user: { id: 'one' } as { id: string } | null,
   tier: 'free', topup: 0, eligible: true, unlimited: false,
   direct: vi.fn(), upstream: vi.fn(), adminRpc: vi.fn(), customerWrites: vi.fn() }));
-const container = process.env.TRANSCRIPT_TEST_CONTAINER;
-const localCluster = !!container && /^longcut-spend-test-\d+-\d+$/.test(container);
+const cluster = readTestPostgres('spend');
+const localCluster = cluster !== null;
 async function sql(text: string): Promise<string> {
   if (!localCluster) throw new Error('Disposable local cluster required');
-  const child = execFile('docker', ['exec', '-i', container!, 'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-At']);
+  const child = execFile(cluster!.psql, cluster!.args());
   child.stdin!.end(text);
   return new Promise((resolve, reject) => {
     let output = '', error = '';

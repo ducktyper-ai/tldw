@@ -1,11 +1,12 @@
+import { startTestPostgres } from './test-postgres.mjs';
 import { readFileSync } from 'node:fs';
 import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 
-// No connection strings, environment credentials, or host ports. Disposable local cluster only.
-const container = `longcut-spend-test-${process.pid}-${Date.now()}`;
-const args = ['exec', '-i', container, 'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-At'];
-const sql = text => execFileSync('docker', args, { input: text, encoding: 'utf8' }).trim();
+// Disposable native PostgreSQL only; no external database, credentials or TCP listener.
+const cluster = startTestPostgres('spend');
+const args = cluster.args();
+const sql = text => execFileSync(cluster.psql, args, { input: text, encoding: 'utf8' }).trim();
 const parse = output => JSON.parse(output.trim().split('\n').at(-1));
 const call = (tier = 'free', ids = ['user:one'], key = 'video:en') =>
   `SET ROLE service_role; SELECT public.reserve_transcript_spend('native-v1','${tier}',ARRAY[${ids.map(v => `'${v}'`).join(',')}],'${key}');`;
@@ -13,13 +14,13 @@ const reserve = (...values) => parse(sql(call(...values)));
 const transition = (id, action) => sql(`SET ROLE service_role; SELECT public.transition_transcript_spend('${id}', '${action}')`).split('\n').at(-1);
 const reset = () => sql('TRUNCATE public.transcript_spend_attempts');
 function denied(text) {
-  const result = spawnSync('docker', args, { input: text, encoding: 'utf8' });
+  const result = spawnSync(cluster.psql, args, { input: text, encoding: 'utf8' });
   assert.notEqual(result.status, 0, text);
   assert.match(result.stderr, /permission denied/);
 }
 function worker(text) {
   return new Promise((resolve, reject) => {
-    const child = spawn('docker', args);
+    const child = spawn(cluster.psql, args);
     let out = '', err = '';
     child.stdout.on('data', data => { out += data; });
     child.stderr.on('data', data => { err += data; });
@@ -28,14 +29,7 @@ function worker(text) {
     child.stdin.end(text);
   });
 }
-execFileSync('docker', ['run', '--rm', '-d', '--name', container, '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', 'postgres:17']);
 try {
-  let ready = false;
-  for (let i = 0; i < 60; i++) {
-    if (spawnSync('docker', ['exec', container, 'pg_isready', '-U', 'postgres']).status === 0) { ready = true; break; }
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-  assert.ok(ready);
   sql(`CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN BYPASSRLS;
     CREATE ROLE migration_executor LOGIN NOSUPERUSER CREATEROLE BYPASSRLS;
     ALTER DATABASE postgres OWNER TO migration_executor; REVOKE CREATE ON SCHEMA public FROM PUBLIC;
@@ -45,13 +39,11 @@ try {
     CREATE FUNCTION public.cleanup_old_rate_limits() RETURNS void LANGUAGE sql AS $$ DELETE FROM public.rate_limits $$;
     ALTER FUNCTION public.cleanup_old_rate_limits() OWNER TO migration_executor;
     INSERT INTO public.rate_limits(key, identifier, timestamp) VALUES ('guest-analysis','historical-guest',now()-interval '90 days');`);
-  const executorArgs = args.map(v => v === 'postgres' ? 'migration_executor' : v);
-  // Explicit database: the non-superuser defaults to a same-named database otherwise.
-  executorArgs.push('-d', 'postgres');
+  const executorArgs = cluster.args('migration_executor');
   const migration = name => readFileSync(new URL(`../supabase/migrations/${name}`, import.meta.url), 'utf8');
-  execFileSync('docker', executorArgs, { input: migration('20260923060000_server_only_limiter.sql'), encoding: 'utf8' });
+  execFileSync(cluster.psql, executorArgs, { input: migration('20260923060000_server_only_limiter.sql'), encoding: 'utf8' });
   const spendMigration = migration('20260925040000_transcript_vendor_spend.sql');
-  const failed = spawnSync('docker', executorArgs, { encoding: 'utf8', input: spendMigration.replace('COMMIT;', "DO $$ BEGIN RAISE EXCEPTION 'injected'; END $$; COMMIT;") });
+  const failed = spawnSync(cluster.psql, executorArgs, { encoding: 'utf8', input: spendMigration.replace('COMMIT;', "DO $$ BEGIN RAISE EXCEPTION 'injected'; END $$; COMMIT;") });
   assert.notEqual(failed.status, 0);
   assert.match(failed.stderr, /injected/);
   assert.equal(sql("SELECT to_regclass('public.guest_analysis_usage') IS NULL"), 't');
@@ -65,7 +57,7 @@ try {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   assert.ok(writerWaiting);
-  execFileSync('docker', executorArgs, { input: spendMigration, encoding: 'utf8' });
+  execFileSync(cluster.psql, executorArgs, { input: spendMigration, encoding: 'utf8' });
   await legacyWriter;
   assert.equal(reserve('guest',['inflight-guest']).reason, 'guest_used');
   // Models an old cached function body that resumes its INSERT after migration commit.
@@ -158,18 +150,18 @@ try {
   console.log('PASS: durable historical/new guest-used state survives limiter cleanup and cookie/IP reset; simultaneous first requests share trusted IP budget.');
 
   const routes = spawnSync('npx', ['vitest', 'run', 'tests/transcript-spend-db.test.ts'], {
-    env: { ...process.env, TRANSCRIPT_TEST_CONTAINER: container }, stdio: 'inherit',
+    env: cluster.env, stdio: 'inherit',
   });
   assert.equal(routes.status, 0, 'Actual route + database integration');
 
   reset();
   sql(`CREATE FUNCTION public.reject_spend() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'storage failure'; END $$;
     CREATE TRIGGER reject_spend BEFORE INSERT ON public.transcript_spend_attempts FOR EACH ROW EXECUTE FUNCTION public.reject_spend();`);
-  const failedWrite = spawnSync('docker', args, { input: call(), encoding: 'utf8' });
+  const failedWrite = spawnSync(cluster.psql, args, { input: call(), encoding: 'utf8' });
   assert.notEqual(failedWrite.status, 0);
   assert.match(failedWrite.stderr, /storage failure/);
   assert.equal(sql('SELECT count(*) FROM public.transcript_spend_attempts'), '0');
   console.log('PASS: write failure never grants admission. All database assertions passed.');
 } finally {
-  execFileSync('docker', ['rm', '-f', container], { stdio: 'ignore' });
+  cluster.stop();
 }

@@ -1,14 +1,15 @@
+import { readTestPostgres } from '../scripts/test-postgres.mjs';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-const container = process.env.TRANSCRIPT_CACHE_TEST_CONTAINER;
-const local = !!container && /^longcut-cache-test-\d+-\d+$/.test(container);
+const cluster = readTestPostgres('cache');
+const local = cluster !== null;
 // Each call starts a separate psql process/connection, including concurrent calls.
 function sql(text: string): Promise<string> {
   if (!local) throw new Error('Disposable local PostgreSQL required');
   return new Promise((resolve, reject) => {
-    const child = execFile('docker', ['exec', '-i', container!, 'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-At'],
+    const child = execFile(cluster!.psql, cluster!.args(),
       (error, stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve(stdout.trim().split('\n').at(-1) ?? ''));
     child.stdin!.end(text);
   });

@@ -82,12 +82,24 @@ npm run lint
 
 `npm test` runs Vitest route/UI tests plus the pre-existing `tsx --test` suites. Route tests execute exported handlers with mocked database/vendor counters. UI tests mount the real analysis-page orchestrator with browser/player child widgets stubbed. Translation tests execute the actual batch queue. SQL tests separately verify real PostgreSQL permissions and transaction behavior.
 
-Local database test (Docker running and `postgres:17` available):
+Database tests require native PostgreSQL 17 tools (`initdb`, `pg_ctl`, `pg_config`
+and `psql`) on the execution host. Set `LONGCUT_TEST_PG_BINDIR` to their directory
+when they are not on `PATH`. Docker is not used.
 
 ```bash
 npm run test:limiter-db
+npm run test:transcript-spend-db
+npm run test:initial-analysis-db
+npm run test:transcript-cache-db
 ```
 
-The runner creates a uniquely named disposable PostgreSQL container with no published ports, then removes it in `finally`. It does not accept a database URL or load environment files. A fresh cluster isolates roles as well as tables. Bootstrap uses the local superuser, but the migration connects as a NOSUPERUSER CREATEROLE/BYPASSRLS database/table/cleanup-function owner, with `public` owned by `pg_database_owner` and the target role absent.
+Each runner creates a uniquely named PostgreSQL cluster in a private temporary
+directory, listens only on its private Unix socket with TCP disabled, then stops
+the server and removes the directory in `finally`. It does not accept a database
+URL or load environment files. The SQL test processes verify the owned temporary
+cluster before connecting. A fresh cluster isolates roles as well as tables.
+Bootstrap uses the local superuser, but the migration connects as a NOSUPERUSER
+CREATEROLE/BYPASSRLS database/table/cleanup-function owner, with `public` owned by
+`pg_database_owner` and the target role absent.
 
 A failure injected immediately before COMMIT must restore policies, table/schema/function ACLs, cleanup definition, rows and memberships, and remove newly created functions/role. Successful migration must leave narrow function ownership/search paths and no executor SET/INHERIT or target schema CREATE privilege. The suite also checks browser denial, server persistence, read/write failure, recovery, retention, and concurrency. Local permission tests do not establish production integration health.

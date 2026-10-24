@@ -1,3 +1,4 @@
+import { readTestPostgres } from '../scripts/test-postgres.mjs';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -11,11 +12,11 @@ const state = vi.hoisted(() => ({
   },
   authError: null as unknown, failRpc: '', loseAck: false, denied: vi.fn(), cacheReads: 0, vanishCache: false,
 }));
-const container = process.env.INITIAL_ANALYSIS_TEST_CONTAINER;
-const local = !!container && /^longcut-initial-test-\d+-\d+$/.test(container);
+const cluster = readTestPostgres('initial');
+const local = cluster !== null;
 async function sql(text: string): Promise<string> {
   if (!local) throw new Error('Local disposable cluster required');
-  const child = execFile('docker', ['exec', '-i', container!, 'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-At']);
+  const child = execFile(cluster!.psql, cluster!.args());
   child.stdin!.end(text);
   return new Promise((resolve, reject) => {
     let out = '', err = '';

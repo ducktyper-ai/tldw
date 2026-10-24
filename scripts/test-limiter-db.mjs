@@ -1,29 +1,20 @@
+import { startTestPostgres } from './test-postgres.mjs';
 import { readFileSync } from 'node:fs';
 import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 
-// Deliberately no URL/env input or published ports. A fresh cluster also isolates roles.
-const container = `longcut-limiter-test-${process.pid}-${Date.now()}`;
+// Disposable native PostgreSQL only; no external database, credentials or TCP listener.
+const cluster = startTestPostgres('limiter');
 const database = `limiter_test_${Date.now()}`;
-const args = ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', database, '-v', 'ON_ERROR_STOP=1', '-At'];
-function sql(text) { return execFileSync('docker', args, { input: text, encoding: 'utf8' }).trim(); }
+const args = cluster.args('postgres', database);
+function sql(text) { return execFileSync(cluster.psql, args, { input: text, encoding: 'utf8' }).trim(); }
 function denied(text) {
-  const result = spawnSync('docker', args, { input: text, encoding: 'utf8' });
+  const result = spawnSync(cluster.psql, args, { input: text, encoding: 'utf8' });
   assert.notEqual(result.status, 0, `Expected permission rejection: ${text}`);
   assert.match(result.stderr, /permission denied/);
 }
-execFileSync('docker', ['run', '--rm', '-d', '--name', container, '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', 'postgres:17']);
 async function run() {
-let ready = false;
-for (let attempt = 0; attempt < 60; attempt++) {
-  if (spawnSync('docker', ['exec', container, 'pg_isready', '-U', 'postgres']).status === 0) {
-    ready = true;
-    break;
-  }
-  await new Promise(resolve => setTimeout(resolve, 500));
-}
-assert.ok(ready, 'Disposable PostgreSQL did not become ready');
-execFileSync('docker', ['exec', container, 'createdb', '-U', 'postgres', database]);
+execFileSync(cluster.psql, cluster.args(), { input: `CREATE DATABASE "${database}"`, encoding: 'utf8' });
 const initial = readFileSync(new URL('../supabase/migrations/20241107000000_initial_schema.sql', import.meta.url), 'utf8');
 const audit = readFileSync(new URL('../supabase/migrations/20251101120001_add_audit_and_rate_limit_tables.sql', import.meta.url), 'utf8');
 const migration = readFileSync(new URL('../supabase/migrations/20260923060000_server_only_limiter.sql', import.meta.url), 'utf8');
@@ -64,7 +55,7 @@ sql(`
   $$;
   INSERT INTO public.rate_limits(key, identifier) VALUES ('rollback-sentinel', 'sentinel');
 `);
-const executorArgs = args.map(value => value === 'postgres' ? 'migration_executor' : value);
+const executorArgs = cluster.args('migration_executor', database);
 const snapshot = () => sql(`SELECT jsonb_build_object(
   'policies', (SELECT jsonb_agg(to_jsonb(p) ORDER BY policyname) FROM pg_policies p WHERE tablename = 'rate_limits'),
   'table_acl', (SELECT relacl FROM pg_class WHERE oid = 'public.rate_limits'::regclass),
@@ -78,14 +69,14 @@ assert.equal(sql("SELECT rolsuper FROM pg_roles WHERE rolname = 'migration_execu
 const before = snapshot();
 // Fail after all permission changes: transaction must restore policies, ACLs,
 // cleanup definition, rows and memberships, including removal of the new role.
-const rollback = spawnSync('docker', executorArgs, { encoding: 'utf8', input:
+const rollback = spawnSync(cluster.psql, executorArgs, { encoding: 'utf8', input:
   migration.replace('COMMIT;', "DO $$ BEGIN RAISE EXCEPTION 'injected pre-commit failure'; END $$; COMMIT;") });
 assert.notEqual(rollback.status, 0);
 assert.match(rollback.stderr, /injected pre-commit failure/);
 assert.equal(snapshot(), before);
 assert.equal(sql("SELECT count(*) FROM pg_roles WHERE rolname = 'limiter_executor'"), '0');
 assert.equal(sql("SELECT count(*) FROM pg_proc WHERE proname IN ('check_rate_limit_server', 'guest_usage_server')"), '0');
-execFileSync('docker', executorArgs, { input: migration, encoding: 'utf8' });
+execFileSync(cluster.psql, executorArgs, { input: migration, encoding: 'utf8' });
 assert.equal(sql("SELECT has_schema_privilege('limiter_executor', 'public', 'CREATE')"), 'f');
 assert.equal(sql("SELECT pg_has_role('migration_executor', 'limiter_executor', 'SET') OR pg_has_role('migration_executor', 'limiter_executor', 'USAGE')"), 'f');
 assert.equal(sql("SELECT count(*) FROM pg_proc WHERE proname IN ('check_rate_limit_server', 'guest_usage_server') AND proowner = 'limiter_executor'::regrole AND prosecdef AND proconfig = ARRAY['search_path=\"\"']"), '2');
@@ -119,7 +110,7 @@ for (const role of ['anon', 'authenticated']) {
 // A required write failure cannot return an allowed decision.
 sql(`CREATE FUNCTION public.reject_limiter_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated storage failure'; END $$;
   CREATE TRIGGER reject_limiter_write BEFORE INSERT ON public.rate_limits FOR EACH ROW EXECUTE FUNCTION public.reject_limiter_write();`);
-const failedWrite = spawnSync('docker', args, { encoding: 'utf8', input:
+const failedWrite = spawnSync(cluster.psql, args, { encoding: 'utf8', input:
   "SET ROLE service_role; SELECT public.check_rate_limit_server('write-failure', 'write-failure', 60000, 1, true);" });
 assert.notEqual(failedWrite.status, 0);
 assert.match(failedWrite.stderr, /simulated storage failure/);
@@ -136,7 +127,7 @@ denied("SET ROLE limiter_executor; UPDATE public.rate_limits SET key = 'forged'"
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE key = 'ratelimit:expired'"), '0');
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE identifier = 'permanent-guest'"), '1');
 const admissions = await Promise.all(Array.from({ length: 8 }, () => new Promise((resolve, reject) => {
-  const child = spawn('docker', args);
+  const child = spawn(cluster.psql, args);
   let output = '';
   let errors = '';
   child.stdout.on('data', data => { output += data; });
@@ -152,5 +143,5 @@ console.log('PASS: non-superuser ownership transfer, transactional rollback, nar
 try {
   await run();
 } finally {
-  execFileSync('docker', ['rm', '-f', container], { stdio: 'ignore' });
+  cluster.stop();
 }
