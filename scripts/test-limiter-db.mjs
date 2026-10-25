@@ -7,14 +7,14 @@ import assert from 'node:assert/strict';
 const cluster = startTestPostgres('limiter');
 const database = `limiter_test_${Date.now()}`;
 const args = cluster.args('postgres', database);
-function sql(text) { return execFileSync(cluster.psql, args, { input: text, encoding: 'utf8' }).trim(); }
+function sql(text) { return execFileSync(cluster.psql, args, { env: cluster.env, input: text, encoding: 'utf8' }).trim(); }
 function denied(text) {
-  const result = spawnSync(cluster.psql, args, { input: text, encoding: 'utf8' });
+  const result = spawnSync(cluster.psql, args, { env: cluster.env, input: text, encoding: 'utf8' });
   assert.notEqual(result.status, 0, `Expected permission rejection: ${text}`);
   assert.match(result.stderr, /permission denied/);
 }
 async function run() {
-execFileSync(cluster.psql, cluster.args(), { input: `CREATE DATABASE "${database}"`, encoding: 'utf8' });
+execFileSync(cluster.psql, cluster.args(), { env: cluster.env, input: `CREATE DATABASE "${database}"`, encoding: 'utf8' });
 const initial = readFileSync(new URL('../supabase/migrations/20241107000000_initial_schema.sql', import.meta.url), 'utf8');
 const audit = readFileSync(new URL('../supabase/migrations/20251101120001_add_audit_and_rate_limit_tables.sql', import.meta.url), 'utf8');
 const migration = readFileSync(new URL('../supabase/migrations/20260923060000_server_only_limiter.sql', import.meta.url), 'utf8');
@@ -69,14 +69,14 @@ assert.equal(sql("SELECT rolsuper FROM pg_roles WHERE rolname = 'migration_execu
 const before = snapshot();
 // Fail after all permission changes: transaction must restore policies, ACLs,
 // cleanup definition, rows and memberships, including removal of the new role.
-const rollback = spawnSync(cluster.psql, executorArgs, { encoding: 'utf8', input:
+const rollback = spawnSync(cluster.psql, executorArgs, { env: cluster.env, encoding: 'utf8', input:
   migration.replace('COMMIT;', "DO $$ BEGIN RAISE EXCEPTION 'injected pre-commit failure'; END $$; COMMIT;") });
 assert.notEqual(rollback.status, 0);
 assert.match(rollback.stderr, /injected pre-commit failure/);
 assert.equal(snapshot(), before);
 assert.equal(sql("SELECT count(*) FROM pg_roles WHERE rolname = 'limiter_executor'"), '0');
 assert.equal(sql("SELECT count(*) FROM pg_proc WHERE proname IN ('check_rate_limit_server', 'guest_usage_server')"), '0');
-execFileSync(cluster.psql, executorArgs, { input: migration, encoding: 'utf8' });
+execFileSync(cluster.psql, executorArgs, { env: cluster.env, input: migration, encoding: 'utf8' });
 assert.equal(sql("SELECT has_schema_privilege('limiter_executor', 'public', 'CREATE')"), 'f');
 assert.equal(sql("SELECT pg_has_role('migration_executor', 'limiter_executor', 'SET') OR pg_has_role('migration_executor', 'limiter_executor', 'USAGE')"), 'f');
 assert.equal(sql("SELECT count(*) FROM pg_proc WHERE proname IN ('check_rate_limit_server', 'guest_usage_server') AND proowner = 'limiter_executor'::regrole AND prosecdef AND proconfig = ARRAY['search_path=\"\"']"), '2');
@@ -110,7 +110,7 @@ for (const role of ['anon', 'authenticated']) {
 // A required write failure cannot return an allowed decision.
 sql(`CREATE FUNCTION public.reject_limiter_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated storage failure'; END $$;
   CREATE TRIGGER reject_limiter_write BEFORE INSERT ON public.rate_limits FOR EACH ROW EXECUTE FUNCTION public.reject_limiter_write();`);
-const failedWrite = spawnSync(cluster.psql, args, { encoding: 'utf8', input:
+const failedWrite = spawnSync(cluster.psql, args, { env: cluster.env, encoding: 'utf8', input:
   "SET ROLE service_role; SELECT public.check_rate_limit_server('write-failure', 'write-failure', 60000, 1, true);" });
 assert.notEqual(failedWrite.status, 0);
 assert.match(failedWrite.stderr, /simulated storage failure/);
@@ -127,7 +127,7 @@ denied("SET ROLE limiter_executor; UPDATE public.rate_limits SET key = 'forged'"
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE key = 'ratelimit:expired'"), '0');
 assert.equal(sql("SELECT count(*) FROM public.rate_limits WHERE identifier = 'permanent-guest'"), '1');
 const admissions = await Promise.all(Array.from({ length: 8 }, () => new Promise((resolve, reject) => {
-  const child = spawn(cluster.psql, args);
+  const child = spawn(cluster.psql, args, { env: cluster.env });
   let output = '';
   let errors = '';
   child.stdout.on('data', data => { output += data; });

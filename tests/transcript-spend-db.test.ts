@@ -14,7 +14,7 @@ const cluster = readTestPostgres('spend');
 const localCluster = cluster !== null;
 async function sql(text: string): Promise<string> {
   if (!localCluster) throw new Error('Disposable local cluster required');
-  const child = execFile(cluster!.psql, cluster!.args());
+  const child = execFile(cluster!.psql, cluster!.args(), { env: cluster!.env });
   child.stdin!.end(text);
   return new Promise((resolve, reject) => {
     let output = '', error = '';

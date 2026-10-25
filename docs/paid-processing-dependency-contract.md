@@ -95,9 +95,18 @@ npm run test:transcript-cache-db
 
 Each runner creates a uniquely named PostgreSQL cluster in a private temporary
 directory, listens only on its private Unix socket with TCP disabled, then stops
-the server and removes the directory in `finally`. It does not accept a database
+the server and removes the directory in `finally`. If shutdown cannot be
+confirmed, cleanup fails and reports the retained directory instead of deleting
+potentially live server data. It does not accept a database
 URL or load environment files. The SQL test processes verify the owned temporary
 cluster before connecting. A fresh cluster isolates roles as well as tables.
+All PostgreSQL tools and child SQL tests receive an environment with every
+`PG*` variable removed, including host-address, service-file and password
+settings. The version check applies to the selected tool directory's `initdb`.
+`tests/postgres-environment.test.ts` exercises poisoned libpq settings and
+shutdown failures against real disposable servers when
+`LONGCUT_TEST_PG_BINDIR` is set; its environment and version-selection checks
+also run without PostgreSQL installed.
 Bootstrap uses the local superuser, but the migration connects as a NOSUPERUSER
 CREATEROLE/BYPASSRLS database/table/cleanup-function owner, with `public` owned by
 `pg_database_owner` and the target role absent.

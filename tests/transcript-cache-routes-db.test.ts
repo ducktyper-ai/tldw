@@ -48,7 +48,7 @@ const local = cluster !== null;
 function sql(text: string): Promise<string> {
   if (!local) throw new Error('Disposable local PostgreSQL required');
   return new Promise((resolve, reject) => {
-    const child = execFile(cluster!.psql, cluster!.args(),
+    const child = execFile(cluster!.psql, cluster!.args(), { env: cluster!.env },
       (error, stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve(stdout.trim().split('\n').at(-1) ?? ''));
     child.stdin!.end(text);
   });

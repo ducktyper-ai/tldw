@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 // Disposable native PostgreSQL only; no external database, credentials or TCP listener.
 const cluster = startTestPostgres('spend');
 const args = cluster.args();
-const sql = text => execFileSync(cluster.psql, args, { input: text, encoding: 'utf8' }).trim();
+const sql = text => execFileSync(cluster.psql, args, { env: cluster.env, input: text, encoding: 'utf8' }).trim();
 const parse = output => JSON.parse(output.trim().split('\n').at(-1));
 const call = (tier = 'free', ids = ['user:one'], key = 'video:en') =>
   `SET ROLE service_role; SELECT public.reserve_transcript_spend('native-v1','${tier}',ARRAY[${ids.map(v => `'${v}'`).join(',')}],'${key}');`;
@@ -14,13 +14,13 @@ const reserve = (...values) => parse(sql(call(...values)));
 const transition = (id, action) => sql(`SET ROLE service_role; SELECT public.transition_transcript_spend('${id}', '${action}')`).split('\n').at(-1);
 const reset = () => sql('TRUNCATE public.transcript_spend_attempts');
 function denied(text) {
-  const result = spawnSync(cluster.psql, args, { input: text, encoding: 'utf8' });
+  const result = spawnSync(cluster.psql, args, { env: cluster.env, input: text, encoding: 'utf8' });
   assert.notEqual(result.status, 0, text);
   assert.match(result.stderr, /permission denied/);
 }
 function worker(text) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cluster.psql, args);
+    const child = spawn(cluster.psql, args, { env: cluster.env });
     let out = '', err = '';
     child.stdout.on('data', data => { out += data; });
     child.stderr.on('data', data => { err += data; });
@@ -41,9 +41,9 @@ try {
     INSERT INTO public.rate_limits(key, identifier, timestamp) VALUES ('guest-analysis','historical-guest',now()-interval '90 days');`);
   const executorArgs = cluster.args('migration_executor');
   const migration = name => readFileSync(new URL(`../supabase/migrations/${name}`, import.meta.url), 'utf8');
-  execFileSync(cluster.psql, executorArgs, { input: migration('20260923060000_server_only_limiter.sql'), encoding: 'utf8' });
+  execFileSync(cluster.psql, executorArgs, { env: cluster.env, input: migration('20260923060000_server_only_limiter.sql'), encoding: 'utf8' });
   const spendMigration = migration('20260925040000_transcript_vendor_spend.sql');
-  const failed = spawnSync(cluster.psql, executorArgs, { encoding: 'utf8', input: spendMigration.replace('COMMIT;', "DO $$ BEGIN RAISE EXCEPTION 'injected'; END $$; COMMIT;") });
+  const failed = spawnSync(cluster.psql, executorArgs, { env: cluster.env, encoding: 'utf8', input: spendMigration.replace('COMMIT;', "DO $$ BEGIN RAISE EXCEPTION 'injected'; END $$; COMMIT;") });
   assert.notEqual(failed.status, 0);
   assert.match(failed.stderr, /injected/);
   assert.equal(sql("SELECT to_regclass('public.guest_analysis_usage') IS NULL"), 't');
@@ -57,7 +57,7 @@ try {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   assert.ok(writerWaiting);
-  execFileSync(cluster.psql, executorArgs, { input: spendMigration, encoding: 'utf8' });
+  execFileSync(cluster.psql, executorArgs, { env: cluster.env, input: spendMigration, encoding: 'utf8' });
   await legacyWriter;
   assert.equal(reserve('guest',['inflight-guest']).reason, 'guest_used');
   // Models an old cached function body that resumes its INSERT after migration commit.
@@ -157,7 +157,7 @@ try {
   reset();
   sql(`CREATE FUNCTION public.reject_spend() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'storage failure'; END $$;
     CREATE TRIGGER reject_spend BEFORE INSERT ON public.transcript_spend_attempts FOR EACH ROW EXECUTE FUNCTION public.reject_spend();`);
-  const failedWrite = spawnSync(cluster.psql, args, { input: call(), encoding: 'utf8' });
+  const failedWrite = spawnSync(cluster.psql, args, { env: cluster.env, input: call(), encoding: 'utf8' });
   assert.notEqual(failedWrite.status, 0);
   assert.match(failedWrite.stderr, /storage failure/);
   assert.equal(sql('SELECT count(*) FROM public.transcript_spend_attempts'), '0');
