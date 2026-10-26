@@ -29,11 +29,13 @@ jobs:
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           # The branch name is passed as data, never expanded into the script,
-          # and must be an ordinary branch name.
+          # and must be an ordinary branch name. It must start with a letter or
+          # digit: a dispatch input is free text, and a leading "-" would reach
+          # the CLI as a flag.
           BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.event.ref }}
         run: |
-          if ! [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-            echo "refusing branch name: not [A-Za-z0-9._/-]+" >&2
+          if ! [[ "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+            echo "refusing branch name: not [A-Za-z0-9][A-Za-z0-9._/-]*" >&2
             exit 1
           fi
           supabase --experimental branches delete "$BRANCH" --project-ref ioczjdqhdcjmrnsicqqz || true
